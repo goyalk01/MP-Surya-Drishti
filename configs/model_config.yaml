@@ -1,0 +1,34 @@
+# Model Configuration — MP Surya-Drishti Segmentation Framework
+# ==============================================================
+
+model:
+  # Model type — must match a registered model in the registry.
+  # Available types: segformer
+  # Future: deeplabv3plus, mask2former, unet
+  model_type: "segformer"
+
+  # Model backbone from HuggingFace Hub (or torchvision, etc.)
+  # SegFormer options: nvidia/mit-b0, nvidia/mit-b1, nvidia/mit-b2, nvidia/mit-b3, nvidia/mit-b4, nvidia/mit-b5
+  # DeepLabV3+ options (future): resnet50, resnet101
+  # Mask2Former options (future): facebook/mask2former-swin-base-ade-semantic
+  backbone: "nvidia/mit-b2"
+
+  # Number of output classes (background + foreground classes)
+  num_labels: 2
+
+  # Class label mappings
+  id2label:
+    0: "background"
+    1: "rooftop"
+  label2id:
+    background: 0
+    rooftop: 1
+
+  # Input image size (height, width) — varies by model
+  # SegFormer: 512 recommended
+  # DeepLabV3+: 512 or 1024
+  # Mask2Former: 512 or 1024
+  image_size: 512
+
+  # Confidence threshold for binary mask generation
+  confidence_threshold: 0.5

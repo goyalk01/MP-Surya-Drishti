@@ -1,0 +1,36 @@
+# Dataset Configuration — MP Surya-Drishti Rooftop Segmentation
+# ==============================================================
+
+dataset:
+  # Dataset name identifier
+  name: "massachusetts_buildings"
+
+  # Root directory containing the official dataset split folders
+  root_dir: "datasets/massachusetts"
+
+  # Official dataset split directory pairs
+  train_images_dir: "train"
+  train_masks_dir: "train_labels"
+
+  val_images_dir: "val"
+  val_masks_dir: "val_labels"
+
+  test_images_dir: "test"
+  test_masks_dir: "test_labels"
+
+  # Supported image file extensions
+  image_extensions:
+    - ".tiff"
+    - ".tif"
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+
+  # Mask pixel value mapping
+  # Massachusetts dataset uses 255 for building, 0 for background
+  mask_building_value: 255
+  mask_background_value: 0
+
+  # Ground Sampling Distance (metres per pixel)
+  # Massachusetts Buildings Dataset: 1 pixel = 1 metre
+  gsd_metres_per_pixel: 1.0

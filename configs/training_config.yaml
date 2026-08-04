@@ -1,0 +1,75 @@
+# Training Configuration — MP Surya-Drishti Rooftop Segmentation
+# ================================================================
+
+training:
+  # Number of training epochs
+  epochs: 50
+
+  # Batch size (Colab T4 16GB: 8 for mit-b2 at 512x512)
+  batch_size: 8
+
+  # Number of DataLoader workers
+  num_workers: 2
+
+  # Pin memory for faster GPU transfer
+  pin_memory: true
+
+  # Optimizer settings
+  optimizer:
+    name: "adamw"
+    learning_rate: 6.0e-5
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  # Learning rate scheduler
+  scheduler:
+    name: "cosine_with_warmup"
+    warmup_steps: 500
+    # Only used for 'step' scheduler
+    step_size: 10
+    gamma: 0.5
+    # Only used for 'plateau' scheduler
+    patience: 5
+    factor: 0.5
+
+  # Loss function configuration
+  loss:
+    name: "bce_dice"
+    bce_weight: 0.5
+    dice_weight: 0.5
+    # pos_weight for BCEWithLogitsLoss — increase if rooftops are rare
+    pos_weight: 2.0
+
+  # Mixed precision training (recommended for CUDA)
+  mixed_precision: true
+
+  # Gradient clipping max norm
+  gradient_clip_max_norm: 1.0
+
+  # Checkpointing
+  checkpoint:
+    save_dir: "models/checkpoints"
+    save_best_only: true
+    monitor_metric: "val_iou"
+    monitor_mode: "max"
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+
+  # Resume training from a checkpoint (set to path or null)
+  resume_from: null
+
+  # Logging
+  log_interval: 10          # Log every N batches
+  val_interval: 1           # Validate every N epochs
+  save_sample_interval: 5   # Save visual samples every N epochs
+
+  # Output directories
+  output:
+    predictions_dir: "outputs/predictions"
+    visualizations_dir: "outputs/visualizations"
+    reports_dir: "outputs/reports"

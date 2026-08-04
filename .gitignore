@@ -1,0 +1,118 @@
+# ==============================================================================
+# MP Surya-Drishti — Production Git Ignore Policy
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Byte-compiled / Optimized / DLL files
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ------------------------------------------------------------------------------
+# Distribution / Packaging / Build
+# ------------------------------------------------------------------------------
+build/
+bdist/
+dist/
+eggs/
+*.egg-info/
+*.egg
+*.whl
+
+# ------------------------------------------------------------------------------
+# Virtual Environments
+# ------------------------------------------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ------------------------------------------------------------------------------
+# Model Weights & Checkpoints (Heavy Artifacts)
+# ------------------------------------------------------------------------------
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.bin
+*.engine
+*.tflite
+models/checkpoints/*
+!models/checkpoints/.gitkeep
+
+# ------------------------------------------------------------------------------
+# Datasets (Local Downloads)
+# ------------------------------------------------------------------------------
+datasets/massachusetts/train/
+datasets/massachusetts/train_labels/
+datasets/massachusetts/val/
+datasets/massachusetts/val_labels/
+datasets/massachusetts/test/
+datasets/massachusetts/test_labels/
+datasets/raw/
+datasets/downloads/
+datasets/*.zip
+datasets/*.tar.gz
+
+# ------------------------------------------------------------------------------
+# Outputs & Experiment Artifacts
+# ------------------------------------------------------------------------------
+outputs/experiments/*
+outputs/predictions/*
+outputs/visualizations/*
+outputs/reports/*
+outputs/split_manifest.json
+!outputs/**/.gitkeep
+
+# ------------------------------------------------------------------------------
+# Logging & Experiment Trackers
+# ------------------------------------------------------------------------------
+logs/
+runs/
+wandb/
+*.log
+*.tfevents.*
+
+# ------------------------------------------------------------------------------
+# Testing & Code Coverage
+# ------------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ------------------------------------------------------------------------------
+# Jupyter Notebooks
+# ------------------------------------------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# ------------------------------------------------------------------------------
+# IDE & Editor Settings
+# ------------------------------------------------------------------------------
+.vscode/
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# ------------------------------------------------------------------------------
+# Operating System Junk
+# ------------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
