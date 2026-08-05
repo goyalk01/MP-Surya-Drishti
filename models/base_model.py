@@ -19,10 +19,12 @@ CONTRACT:
 from __future__ import annotations
 
 import logging
+import random
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,16 +39,9 @@ class BaseSegmentationModel(ABC, nn.Module):
     Subclasses must implement:
         - ``model_type`` property
         - ``forward()``
-        - ``_build_model()`` (called during __init__)
         - ``_get_state_dict()`` (model weights to save)
-        - ``_load_state_dict()`` (restore model weights)
+        - ``_load_state_dict_from_checkpoint()`` (restore model weights)
         - ``from_checkpoint()`` class method
-
-    The base class provides shared implementations for:
-        - ``predict()`` — generic argmax-based prediction from logits
-        - ``get_confidence()`` — softmax confidence extraction
-        - ``save_checkpoint()`` / ``load_checkpoint()`` — persistence
-        - ``get_param_count()`` — parameter counting
 
     Args:
         backbone: Model backbone identifier (e.g., ``nvidia/mit-b2``).
@@ -88,12 +83,7 @@ class BaseSegmentationModel(ABC, nn.Module):
     @property
     @abstractmethod
     def model_type(self) -> str:
-        """
-        Unique string identifier for this model type.
-
-        Used in the model registry, checkpoint files, and config.
-        Examples: "segformer", "deeplabv3plus", "mask2former", "unet"
-        """
+        """Unique string identifier for this model type."""
         ...
 
     @abstractmethod
@@ -105,44 +95,20 @@ class BaseSegmentationModel(ABC, nn.Module):
         """
         Forward pass through the model.
 
-        MUST return a dictionary containing at minimum:
-            - "upsampled_logits": Tensor of shape (B, num_labels, H, W)
-              where H, W match the input spatial dimensions.
-
-        OPTIONALLY may also include:
-            - "loss": Scalar loss tensor (if labels provided and the
-              model computes loss internally).
-            - "logits": Raw logits before upsampling.
-
-        Args:
-            pixel_values: Input images (B, C, H, W).
-            labels: Optional ground truth masks (B, H, W).
-
-        Returns:
-            Dictionary with at least "upsampled_logits".
+        Must return dict with at least "upsampled_logits" (B, num_labels, H, W).
         """
         ...
 
     @abstractmethod
     def _get_state_dict(self) -> dict[str, Any]:
-        """
-        Return the model's state dictionary for checkpointing.
-
-        This allows models that wrap inner modules (e.g., HuggingFace
-        models) to return the correct state dict.
-        """
+        """Return the model's state dictionary for checkpointing."""
         ...
 
     @abstractmethod
     def _load_state_dict_from_checkpoint(
         self, state_dict: dict[str, Any]
     ) -> None:
-        """
-        Load model weights from a checkpoint state dictionary.
-
-        Args:
-            state_dict: The model state dict from a saved checkpoint.
-        """
+        """Load model weights strictly from a checkpoint state dictionary."""
         ...
 
     @classmethod
@@ -151,21 +117,8 @@ class BaseSegmentationModel(ABC, nn.Module):
         cls,
         checkpoint_path: str | Path,
         device: Optional[torch.device] = None,
-    ) -> "BaseSegmentationModel":
-        """
-        Create a model instance from a saved checkpoint.
-
-        This is the standard way to load any model for inference.
-        The checkpoint must contain "model_type" to identify which
-        class to instantiate.
-
-        Args:
-            checkpoint_path: Path to the checkpoint file.
-            device: Device to place the model on.
-
-        Returns:
-            Initialized model with loaded weights.
-        """
+    ) -> BaseSegmentationModel:
+        """Create a model instance and restore weights from a saved checkpoint."""
         ...
 
     # ----------------------------------------------------------------
@@ -178,9 +131,6 @@ class BaseSegmentationModel(ABC, nn.Module):
     ) -> dict[str, torch.Tensor]:
         """
         Generate predictions (binary masks and confidence maps).
-
-        This is a generic implementation that works for any model
-        that returns "upsampled_logits" from forward().
 
         Args:
             pixel_values: Input tensor (B, C, H, W).
@@ -196,13 +146,8 @@ class BaseSegmentationModel(ABC, nn.Module):
             outputs = self.forward(pixel_values)
             upsampled_logits = outputs["upsampled_logits"]
 
-            # Softmax to get class probabilities
             probabilities = F.softmax(upsampled_logits, dim=1)
-
-            # Foreground class probability (class index 1)
             foreground_prob = probabilities[:, 1, :, :]
-
-            # Binary mask using threshold
             binary_mask = (foreground_prob >= self.confidence_threshold).long()
 
         return {
@@ -215,15 +160,7 @@ class BaseSegmentationModel(ABC, nn.Module):
         self,
         logits: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute per-pixel confidence scores from logits.
-
-        Args:
-            logits: Raw logits tensor (B, num_labels, H, W).
-
-        Returns:
-            Confidence map (B, H, W) with values in [0, 1].
-        """
+        """Compute per-pixel confidence scores from logits."""
         probabilities = F.softmax(logits, dim=1)
         confidence, _ = torch.max(probabilities, dim=1)
         return confidence
@@ -234,26 +171,33 @@ class BaseSegmentationModel(ABC, nn.Module):
         epoch: int,
         optimizer_state: Optional[dict] = None,
         scheduler_state: Optional[dict] = None,
+        scaler_state: Optional[dict] = None,
         metrics: Optional[dict[str, float]] = None,
+        config: Optional[dict[str, Any]] = None,
         extra: Optional[dict[str, Any]] = None,
     ) -> None:
         """
-        Save a full training checkpoint.
-
-        The checkpoint always includes "model_type" so that
-        ``load_model_from_checkpoint()`` in the registry can
-        identify which class to instantiate.
+        Save a full training checkpoint containing all parameters and state objects.
 
         Args:
             path: File path for the checkpoint.
             epoch: Current training epoch.
             optimizer_state: Optimizer state dict.
             scheduler_state: LR scheduler state dict.
+            scaler_state: AMP GradScaler state dict.
             metrics: Validation metrics at this checkpoint.
-            extra: Any additional metadata to save.
+            config: Full experiment configuration dictionary.
+            extra: Additional metadata (e.g., best_iou, best_loss).
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        random_state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
 
         checkpoint = {
             "model_type": self.model_type,
@@ -265,14 +209,19 @@ class BaseSegmentationModel(ABC, nn.Module):
             "label2id": self.label2id,
             "confidence_threshold": self.confidence_threshold,
             "image_size": self.image_size,
+            "random_state": random_state,
         }
 
         if optimizer_state is not None:
             checkpoint["optimizer_state_dict"] = optimizer_state
         if scheduler_state is not None:
             checkpoint["scheduler_state_dict"] = scheduler_state
+        if scaler_state is not None:
+            checkpoint["scaler_state_dict"] = scaler_state
         if metrics is not None:
             checkpoint["metrics"] = metrics
+        if config is not None:
+            checkpoint["config"] = config
         if extra is not None:
             checkpoint["extra"] = extra
 
@@ -288,6 +237,7 @@ class BaseSegmentationModel(ABC, nn.Module):
         self,
         path: str | Path,
         device: Optional[torch.device] = None,
+        restore_random_state: bool = True,
     ) -> dict[str, Any]:
         """
         Load a training checkpoint into the current model instance.
@@ -295,10 +245,10 @@ class BaseSegmentationModel(ABC, nn.Module):
         Args:
             path: Path to the checkpoint file.
             device: Device to map tensors to.
+            restore_random_state: Whether to restore RNG states for reproducible training resume.
 
         Returns:
-            Full checkpoint dictionary (includes optimizer/scheduler
-            states and metrics for training resume).
+            Full checkpoint dictionary.
         """
         path = Path(path)
         if not path.exists():
@@ -310,6 +260,18 @@ class BaseSegmentationModel(ABC, nn.Module):
         )
 
         self._load_state_dict_from_checkpoint(checkpoint["model_state_dict"])
+
+        if restore_random_state and "random_state" in checkpoint:
+            rng_data = checkpoint["random_state"]
+            if "python" in rng_data:
+                random.setstate(rng_data["python"])
+            if "numpy" in rng_data:
+                np.random.set_state(rng_data["numpy"])
+            if "torch" in rng_data:
+                torch.set_rng_state(rng_data["torch"])
+            if "cuda" in rng_data and rng_data["cuda"] is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng_data["cuda"])
+
         logger.info(
             "Loaded %s checkpoint from %s (epoch=%d)",
             self.model_type,
@@ -320,12 +282,7 @@ class BaseSegmentationModel(ABC, nn.Module):
         return checkpoint
 
     def get_param_count(self) -> dict[str, int]:
-        """
-        Get the number of model parameters.
-
-        Returns:
-            Dictionary with 'total', 'trainable', and 'frozen' counts.
-        """
+        """Get the number of model parameters."""
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(
             p.numel() for p in self.parameters() if p.requires_grad

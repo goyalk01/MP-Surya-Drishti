@@ -1,8 +1,9 @@
 """
-Device detection utilities for PyTorch.
+Device detection and GPU optimization utilities for PyTorch.
 
-Auto-detects the best available compute device (CUDA, MPS, CPU)
-and provides device information logging for debugging.
+Auto-detects the best available compute device (CUDA, MPS, CPU),
+enables CUDNN benchmarking for optimal convolution throughput,
+and logs diagnostic hardware info.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 def get_device() -> torch.device:
     """
-    Auto-detect the best available compute device.
+    Auto-detect the best available compute device and configure hardware flags.
 
     Priority: CUDA > MPS (Apple Silicon) > CPU.
 
@@ -26,7 +27,8 @@ def get_device() -> torch.device:
     """
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        logger.info("Using device: CUDA (%s)", torch.cuda.get_device_name(0))
+        torch.backends.cudnn.benchmark = True
+        logger.info("Using device: CUDA (%s) | CUDNN benchmark enabled", torch.cuda.get_device_name(0))
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
         logger.info("Using device: MPS (Apple Silicon)")

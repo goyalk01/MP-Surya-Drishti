@@ -4,6 +4,7 @@ Unit tests for the dataset loader module supporting official dataset splits.
 
 import pytest
 
+pytest.importorskip("cv2")
 from preprocessing.dataset_loader import MassachusettsDataset
 
 
@@ -34,12 +35,10 @@ class TestMassachusettsDataset:
         train_dir.mkdir()
         train_labels_dir.mkdir()
 
-        # Create test files
         for name in ["img1", "img2", "img3"]:
             (train_dir / f"{name}.png").write_bytes(b"fake_image")
             (train_labels_dir / f"{name}.png").write_bytes(b"fake_mask")
 
-        # Extra image with no mask
         (train_dir / "unmatched.png").write_bytes(b"fake_image")
 
         image_paths, mask_paths = MassachusettsDataset.discover_pairs(

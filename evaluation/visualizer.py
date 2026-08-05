@@ -4,7 +4,7 @@ Visualization utilities for segmentation results.
 Provides plotting functions for:
 - Side-by-side comparison (original, ground truth, prediction)
 - Colored overlay on original image
-- Training curves (loss, IoU, Dice over epochs)
+- Training history curves (Loss, IoU, Dice, Accuracy, Learning Rate over epochs)
 - Epoch sample snapshots
 """
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -66,7 +66,7 @@ class SegmentationVisualizer:
             ground_truth: Ground truth mask (H, W) binary.
             prediction: Predicted mask (H, W) binary.
             title: Plot title.
-            filename: Output filename (auto-generated if None).
+            filename: Output filename.
             metrics: Optional metrics dict to display as text.
 
         Returns:
@@ -86,7 +86,6 @@ class SegmentationVisualizer:
         axes[2].set_title("Prediction", fontsize=14)
         axes[2].axis("off")
 
-        # Add metrics text if provided
         if metrics:
             metric_text = " | ".join(
                 f"{k}: {v:.4f}" for k, v in metrics.items()
@@ -154,23 +153,12 @@ class SegmentationVisualizer:
         original: np.ndarray,
         mask: np.ndarray,
     ) -> np.ndarray:
-        """
-        Create a colored overlay image without plotting.
-
-        Args:
-            original: Original image (H, W, 3) in RGB uint8.
-            mask: Binary mask (H, W).
-
-        Returns:
-            Overlay image (H, W, 3) in RGB uint8.
-        """
+        """Create a colored overlay image without plotting."""
         overlay = original.copy()
 
-        # Create colored mask
         color_mask = np.zeros_like(original)
         color_mask[mask > 0] = self.overlay_color
 
-        # Blend
         mask_region = mask > 0
         overlay[mask_region] = (
             (1 - self.overlay_alpha) * original[mask_region]
@@ -179,15 +167,20 @@ class SegmentationVisualizer:
 
         return overlay
 
-    def plot_training_curves(
+    def plot_training_history(
         self,
-        history: list[dict[str, float]],
+        history: list[dict[str, Any]],
         filename: str = "training_curves.png",
     ) -> Path:
         """
-        Plot training and validation curves over epochs.
+        Plot training and validation history curves over epochs.
 
-        Generates a 2×2 grid: Loss, IoU, Dice, Learning Rate.
+        Generates 5 curves across a 2×3 grid:
+            1. Loss Curve (Train Loss & Val Loss)
+            2. IoU Curve (Val IoU)
+            3. Dice Curve (Val Dice)
+            4. Pixel Accuracy Curve (Val Accuracy)
+            5. Learning Rate Curve (LR)
 
         Args:
             history: List of per-epoch metric dictionaries.
@@ -198,11 +191,11 @@ class SegmentationVisualizer:
         """
         epochs = [h.get("epoch", i + 1) for i, h in enumerate(history)]
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
-        # Loss
-        train_loss = [h.get("train_loss", 0) for h in history]
-        val_loss = [h.get("val_loss", 0) for h in history]
+        # 1. Loss Curve
+        train_loss = [h.get("train_loss", 0.0) for h in history]
+        val_loss = [h.get("val_loss", 0.0) for h in history]
         axes[0, 0].plot(epochs, train_loss, "b-", label="Train Loss", linewidth=2)
         axes[0, 0].plot(epochs, val_loss, "r-", label="Val Loss", linewidth=2)
         axes[0, 0].set_title("Loss", fontsize=14)
@@ -210,24 +203,32 @@ class SegmentationVisualizer:
         axes[0, 0].legend()
         axes[0, 0].grid(True, alpha=0.3)
 
-        # IoU
-        val_iou = [h.get("val_iou", 0) for h in history]
+        # 2. IoU Curve
+        val_iou = [h.get("val_iou", 0.0) for h in history]
         axes[0, 1].plot(epochs, val_iou, "g-", label="Val IoU", linewidth=2)
-        axes[0, 1].set_title("IoU", fontsize=14)
+        axes[0, 1].set_title("Validation IoU", fontsize=14)
         axes[0, 1].set_xlabel("Epoch")
         axes[0, 1].legend()
         axes[0, 1].grid(True, alpha=0.3)
 
-        # Dice
-        val_dice = [h.get("val_dice", 0) for h in history]
-        axes[1, 0].plot(epochs, val_dice, "m-", label="Val Dice", linewidth=2)
-        axes[1, 0].set_title("Dice Score", fontsize=14)
+        # 3. Dice Curve
+        val_dice = [h.get("val_dice", 0.0) for h in history]
+        axes[0, 2].plot(epochs, val_dice, "m-", label="Val Dice", linewidth=2)
+        axes[0, 2].set_title("Validation Dice", fontsize=14)
+        axes[0, 2].set_xlabel("Epoch")
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
+
+        # 4. Pixel Accuracy Curve
+        val_acc = [h.get("val_pixel_accuracy", 0.0) for h in history]
+        axes[1, 0].plot(epochs, val_acc, "c-", label="Val Accuracy", linewidth=2)
+        axes[1, 0].set_title("Pixel Accuracy", fontsize=14)
         axes[1, 0].set_xlabel("Epoch")
         axes[1, 0].legend()
         axes[1, 0].grid(True, alpha=0.3)
 
-        # Learning Rate
-        lr = [h.get("lr", 0) for h in history]
+        # 5. Learning Rate Curve
+        lr = [h.get("lr", 0.0) for h in history]
         axes[1, 1].plot(epochs, lr, "k-", label="Learning Rate", linewidth=2)
         axes[1, 1].set_title("Learning Rate", fontsize=14)
         axes[1, 1].set_xlabel("Epoch")
@@ -235,15 +236,21 @@ class SegmentationVisualizer:
         axes[1, 1].legend()
         axes[1, 1].grid(True, alpha=0.3)
 
-        fig.suptitle("Training Progress", fontsize=16)
+        # Hide 6th empty subplot
+        axes[1, 2].axis("off")
+
+        fig.suptitle("Training Progress & Metrics Summary", fontsize=16)
         plt.tight_layout()
 
         save_path = self.output_dir / filename
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-        logger.info("Saved training curves: %s", save_path)
+        logger.info("Saved training history plot: %s", save_path)
         return save_path
+
+    # Alias for backward compatibility
+    plot_training_curves = plot_training_history
 
     def save_epoch_sample(
         self,
@@ -253,19 +260,7 @@ class SegmentationVisualizer:
         prediction: np.ndarray,
         metrics: Optional[dict[str, float]] = None,
     ) -> Path:
-        """
-        Save a visual sample for a specific training epoch.
-
-        Args:
-            epoch: Current epoch number.
-            original: Original image (H, W, 3).
-            ground_truth: Ground truth mask (H, W).
-            prediction: Predicted mask (H, W).
-            metrics: Optional metrics for this sample.
-
-        Returns:
-            Path to the saved figure.
-        """
+        """Save a visual sample for a specific training epoch."""
         filename = f"epoch_{epoch:03d}_sample.png"
         return self.plot_comparison(
             original=original,

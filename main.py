@@ -4,17 +4,11 @@ MP Surya-Drishti — Segmentation Framework CLI Entry Point.
 Model-agnostic entry point that uses the model registry to create
 and load any registered segmentation model.
 
-Supports:
-    - Official dataset splits (train/train_labels, val/val_labels, test/test_labels)
-    - Automatic experiment versioning (outputs/experiments/exp_001, exp_002...)
-    - TensorBoard logging & smart checkpointing (best_iou.pth, best_loss.pth, latest.pth)
-    - Prediction report generation (prediction_report.json for Solar Analytics)
-
-Usage:
-    python main.py train
-    python main.py infer --image path/to/image.jpg
-    python main.py evaluate
-    python main.py verify-dataset
+Commands:
+    verify-dataset  Verify official dataset splits and pairing integrity
+    train           Train model on official partitions with TensorBoard & experiment tracking
+    infer           Run inference on a single image and generate prediction_report.json
+    evaluate        Evaluate model performance on the official test set using trained weights
 """
 
 from __future__ import annotations
@@ -25,19 +19,58 @@ from pathlib import Path
 
 import yaml
 
+from utils.config_validator import (
+    validate_dataset_config,
+    validate_model_config,
+    validate_training_config,
+)
 from utils.logger import setup_logger
 
 
 def load_config(config_path: str) -> dict:
-    """Load a YAML configuration file."""
-    with open(config_path, "r", encoding="utf-8") as f:
+    """Load and parse a YAML configuration file."""
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Configuration file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def find_default_checkpoint() -> Path:
+    """
+    Find the latest trained best_iou.pth checkpoint across experiment directories.
+
+    Returns:
+        Path to best_iou.pth file.
+
+    Raises:
+        FileNotFoundError: If no trained checkpoint is found.
+    """
+    candidates = [
+        Path("models/checkpoints/best_iou.pth"),
+        Path("outputs/checkpoints/best_iou.pth"),
+    ]
+
+    # Look in experiments
+    exp_dir = Path("outputs/experiments")
+    if exp_dir.exists():
+        for exp in sorted(exp_dir.glob("exp_*"), reverse=True):
+            ckpt = exp / "checkpoints" / "best_iou.pth"
+            if ckpt.exists():
+                return ckpt
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError(
+        "No trained checkpoint ('best_iou.pth') found. "
+        "Please run training first using: python main.py train"
+    )
 
 
 def cmd_train(args: argparse.Namespace) -> None:
     """Execute training pipeline using official dataset splits."""
-    import torch
-
     from models.registry import create_model, ensure_models_registered
     from preprocessing.augmentation import AugmentationPipeline
     from preprocessing.dataset_loader import MassachusettsDataset
@@ -46,6 +79,16 @@ def cmd_train(args: argparse.Namespace) -> None:
     from utils.device_utils import print_device_info
     from utils.experiment_manager import ExperimentManager
 
+    # Load & Validate Configs
+    model_config = load_config(args.model_config)
+    dataset_config = load_config(args.dataset_config)
+    training_config = load_config(args.training_config)
+
+    model_cfg = validate_model_config(model_config)
+    dataset_cfg = validate_dataset_config(dataset_config)
+    training_cfg = validate_training_config(training_config)
+
+    # Initialize experiment manager
     exp_manager = ExperimentManager(
         base_dir=args.experiment_dir,
         exp_name=args.exp_name,
@@ -58,26 +101,17 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     logger.info("=" * 60)
     logger.info("MP Surya-Drishti — Segmentation Framework Training")
-    logger.info("Experiment: %s", exp_manager.exp_name)
+    logger.info("Experiment: %s | Output Path: %s", exp_manager.exp_name, exp_manager.exp_dir)
     logger.info("=" * 60)
 
     print_device_info()
-
-    # Load configs
-    model_config = load_config(args.model_config)
-    dataset_config = load_config(args.dataset_config)
-    training_config = load_config(args.training_config)
-
-    model_cfg = model_config["model"]
-    dataset_cfg = dataset_config["dataset"]
-    training_cfg = training_config["training"]
 
     # Save experiment config snapshot
     exp_manager.save_config_snapshot(model_config, dataset_config, training_config)
 
     ensure_models_registered()
 
-    # Discover official splits: train, val, test
+    # Discover official splits: train, val
     logger.info("Loading official dataset splits from: %s", dataset_cfg["root_dir"])
 
     train_img_paths, train_mask_paths = MassachusettsDataset.discover_pairs(
@@ -94,7 +128,6 @@ def cmd_train(args: argparse.Namespace) -> None:
         extensions=dataset_cfg.get("image_extensions"),
     )
 
-    # Augmentations
     augmentation = AugmentationPipeline(image_size=model_cfg["image_size"])
     train_transform = augmentation.get_train_transform()
     val_transform = augmentation.get_val_transform()
@@ -138,8 +171,10 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     result = trainer.train(resume_from=training_cfg.get("resume_from"))
 
+    # Save metrics history
     exp_manager.save_metrics_history(result["history"])
 
+    # Generate training curves plot in plots_dir
     try:
         from evaluation.visualizer import SegmentationVisualizer
         visualizer = SegmentationVisualizer(output_dir=exp_manager.plots_dir)
@@ -170,13 +205,21 @@ def cmd_infer(args: argparse.Namespace) -> None:
     logger.info("=" * 60)
 
     dataset_config = load_config(args.dataset_config)
-    gsd = dataset_config["dataset"].get("gsd_metres_per_pixel", 1.0)
+    dataset_cfg = validate_dataset_config(dataset_config)
+    gsd = dataset_cfg.get("gsd_metres_per_pixel", 1.0)
 
     model_config = load_config(args.model_config)
-    image_size = model_config["model"].get("image_size", 512)
+    model_cfg = validate_model_config(model_config)
+    image_size = model_cfg.get("image_size", 512)
+
+    # Determine checkpoint path
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists():
+        checkpoint_path = find_default_checkpoint()
+        logger.info("Using auto-detected checkpoint: %s", checkpoint_path)
 
     inferencer = SegmentationInferencer(
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=checkpoint_path,
         image_size=image_size,
         gsd=gsd,
     )
@@ -218,7 +261,7 @@ def cmd_infer(args: argparse.Namespace) -> None:
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
-    """Evaluate model on the official test set."""
+    """Evaluate model on the official test set using trained weights."""
     import torch
 
     from evaluation.metrics import SegmentationMetrics
@@ -230,16 +273,27 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 
     logger = setup_logger(log_level="DEBUG" if args.verbose else "INFO")
 
+    logger.info("=" * 60)
+    logger.info("MP Surya-Drishti — Segmentation Framework Evaluation")
+    logger.info("=" * 60)
+
     model_config = load_config(args.model_config)
     dataset_config = load_config(args.dataset_config)
 
-    model_cfg = model_config["model"]
-    dataset_cfg = dataset_config["dataset"]
+    model_cfg = validate_model_config(model_config)
+    dataset_cfg = validate_dataset_config(dataset_config)
 
     ensure_models_registered()
 
+    # Determine checkpoint path
+    checkpoint_path = Path(args.checkpoint)
+    if not checkpoint_path.exists():
+        checkpoint_path = find_default_checkpoint()
+        logger.info("Using auto-detected checkpoint: %s", checkpoint_path)
+
     device = get_device()
-    model = load_model_from_checkpoint(args.checkpoint, device=device)
+    logger.info("Loading trained weights from checkpoint: %s", checkpoint_path)
+    model = load_model_from_checkpoint(checkpoint_path, device=device)
     model.eval()
 
     test_img_paths, test_mask_paths = MassachusettsDataset.discover_pairs(
@@ -277,12 +331,14 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     print("\n" + "=" * 50)
     print("  EVALUATION RESULTS")
     print("=" * 50)
-    print(f"  Test Samples:     {len(test_dataset)}")
-    print(f"  Mean IoU:         {results['iou']:.4f}")
-    print(f"  Rooftop IoU:      {results['rooftop_iou']:.4f}")
-    print(f"  Mean Dice:        {results['dice']:.4f}")
-    print(f"  Rooftop Dice:     {results['rooftop_dice']:.4f}")
-    print(f"  Pixel Accuracy:   {results['pixel_accuracy']:.4f}")
+    print(f"  Checkpoint Loaded: {checkpoint_path}")
+    print(f"  Test Samples:      {len(test_dataset)}")
+    print(f"  Mean IoU:          {results['iou']:.4f}")
+    print(f"  Rooftop IoU:       {results['rooftop_iou']:.4f}")
+    print(f"  Mean Dice:         {results['dice']:.4f}")
+    print(f"  Rooftop Dice:      {results['rooftop_dice']:.4f}")
+    print(f"  Pixel Accuracy:    {results['pixel_accuracy']:.4f}")
+    print(f"  Results saved:     {output_dir / 'evaluation_results.json'}")
     print("=" * 50 + "\n")
 
 
@@ -293,7 +349,7 @@ def cmd_verify_dataset(args: argparse.Namespace) -> None:
     logger = setup_logger(log_level="INFO")
 
     dataset_config = load_config(args.dataset_config)
-    dataset_cfg = dataset_config["dataset"]
+    dataset_cfg = validate_dataset_config(dataset_config)
 
     logger.info("Verifying dataset splits at: %s", dataset_cfg["root_dir"])
 
@@ -354,7 +410,7 @@ def cmd_verify_dataset(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    """CLI Parser."""
+    """CLI Entry Point."""
     parser = argparse.ArgumentParser(
         prog="MP Surya-Drishti — Segmentation Framework",
         description="Model-agnostic segmentation framework for solar advisory.",

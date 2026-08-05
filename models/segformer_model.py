@@ -1,17 +1,9 @@
 """
 SegFormer model implementation for the rooftop segmentation framework.
 
-This is the FIRST registered model in the MP Surya-Drishti CV framework.
-It extends ``BaseSegmentationModel`` and registers itself via the
-``@register_model("segformer")`` decorator.
-
-To add a new model (e.g., DeepLabV3+), create a similar file that:
-    1. Extends ``BaseSegmentationModel``
-    2. Uses ``@register_model("deeplabv3plus")``
-    3. Implements all abstract methods
-    4. Gets imported in ``models/registry.py::ensure_models_registered()``
-
-That's it — the entire pipeline (train, infer, evaluate) works automatically.
+Wraps HuggingFace ``SegformerForSemanticSegmentation`` behind the
+framework's ``BaseSegmentationModel`` interface. Supports clean transfer
+learning initialization as well as exact, warning-free checkpoint restoration.
 """
 
 from __future__ import annotations
@@ -45,6 +37,8 @@ class SegFormerModel(BaseSegmentationModel):
         label2id: Mapping from label name to class index.
         confidence_threshold: Threshold for binary mask generation.
         image_size: Expected input image size (for upsampling logits).
+        pretrained: If True, loads pretrained backbone weights from HF Hub for training.
+            If False, initializes architecture from config for loading checkpoints without HF warnings.
     """
 
     @property
@@ -59,6 +53,7 @@ class SegFormerModel(BaseSegmentationModel):
         label2id: Optional[dict[str, int]] = None,
         confidence_threshold: float = 0.5,
         image_size: int = 512,
+        pretrained: bool = True,
     ) -> None:
         super().__init__(
             backbone=backbone,
@@ -69,22 +64,51 @@ class SegFormerModel(BaseSegmentationModel):
             image_size=image_size,
         )
 
-        # Load SegFormer from HuggingFace
-        from transformers import SegformerForSemanticSegmentation
+        from transformers import SegformerConfig, SegformerForSemanticSegmentation
+        import transformers.utils.logging as hf_logging
 
-        self.model = SegformerForSemanticSegmentation.from_pretrained(
-            backbone,
-            num_labels=num_labels,
-            id2label=self.id2label,
-            label2id=self.label2id,
-            ignore_mismatched_sizes=True,
-        )
+        if id2label is None:
+            id2label = {0: "background", 1: "rooftop"}
+        if label2id is None:
+            label2id = {"background": 0, "rooftop": 1}
 
-        logger.info(
-            "Loaded SegFormer backbone '%s' with %d labels (head reinitialized)",
-            backbone,
-            num_labels,
-        )
+        self.id2label = id2label
+        self.label2id = label2id
+
+        if pretrained:
+            # Suppress HF log warnings during initial head re-initialization
+            prev_verbosity = hf_logging.get_verbosity()
+            hf_logging.set_verbosity_error()
+            try:
+                self.model = SegformerForSemanticSegmentation.from_pretrained(
+                    backbone,
+                    num_labels=num_labels,
+                    id2label=id2label,
+                    label2id=label2id,
+                    ignore_mismatched_sizes=True,
+                )
+            finally:
+                hf_logging.set_verbosity(prev_verbosity)
+
+            logger.info(
+                "Initialized SegFormer model from pretrained backbone '%s' (num_labels=%d)",
+                backbone,
+                num_labels,
+            )
+        else:
+            # Construct architecture from config for clean checkpoint loading
+            config = SegformerConfig.from_pretrained(
+                backbone,
+                num_labels=num_labels,
+                id2label=id2label,
+                label2id=label2id,
+            )
+            self.model = SegformerForSemanticSegmentation(config)
+            logger.info(
+                "Initialized SegFormer architecture from config '%s' (num_labels=%d)",
+                backbone,
+                num_labels,
+            )
 
     def forward(
         self,
@@ -96,14 +120,12 @@ class SegFormerModel(BaseSegmentationModel):
 
         Args:
             pixel_values: Input tensor of shape (B, C, H, W).
-            labels: Optional ground truth masks of shape (B, H, W) with
-                class indices.
+            labels: Optional ground truth masks of shape (B, H, W) with class indices.
 
         Returns:
             Dictionary containing:
                 - logits: Raw model output (B, num_labels, H/4, W/4).
-                - upsampled_logits: Logits interpolated to input size
-                    (B, num_labels, H, W).
+                - upsampled_logits: Logits interpolated to input size (B, num_labels, H, W).
                 - loss: Cross-entropy loss (only if labels provided).
         """
         outputs = self.model(
@@ -138,17 +160,17 @@ class SegFormerModel(BaseSegmentationModel):
     def _load_state_dict_from_checkpoint(
         self, state_dict: dict[str, Any]
     ) -> None:
-        """Load weights into the inner HuggingFace model."""
-        self.model.load_state_dict(state_dict)
+        """Load model weights strictly from checkpoint."""
+        self.model.load_state_dict(state_dict, strict=True)
 
     @classmethod
     def from_checkpoint(
         cls,
         checkpoint_path: str | Path,
         device: Optional[torch.device] = None,
-    ) -> "SegFormerModel":
+    ) -> SegFormerModel:
         """
-        Create a SegFormerModel instance from a saved checkpoint.
+        Create a SegFormerModel instance and restore weights strictly from checkpoint.
 
         Args:
             checkpoint_path: Path to the checkpoint file.
@@ -169,15 +191,16 @@ class SegFormerModel(BaseSegmentationModel):
             label2id=checkpoint.get("label2id", {"background": 0, "rooftop": 1}),
             confidence_threshold=checkpoint.get("confidence_threshold", 0.5),
             image_size=checkpoint.get("image_size", 512),
+            pretrained=False,
         )
 
-        model.model.load_state_dict(checkpoint["model_state_dict"])
+        model.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
 
         if device:
             model = model.to(device)
 
         logger.info(
-            "Loaded SegFormerModel from checkpoint '%s' (epoch=%d)",
+            "Successfully restored SegFormerModel from checkpoint '%s' (epoch=%d, strict=True)",
             checkpoint_path,
             checkpoint.get("epoch", -1),
         )
@@ -185,5 +208,5 @@ class SegFormerModel(BaseSegmentationModel):
         return model
 
 
-# Keep backward-compatible alias
+# Backward-compatible alias
 RooftopSegFormer = SegFormerModel

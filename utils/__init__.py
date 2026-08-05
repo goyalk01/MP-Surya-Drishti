@@ -6,6 +6,11 @@ from utils.logger import setup_logger
 from utils.device_utils import get_device, print_device_info
 from utils.checkpoint_manager import CheckpointManager
 from utils.experiment_manager import ExperimentManager
+from utils.config_validator import (
+    validate_model_config,
+    validate_dataset_config,
+    validate_training_config,
+)
 from utils.io_utils import load_image, save_image, save_json, load_json
 
 __all__ = [
@@ -14,6 +19,9 @@ __all__ = [
     "print_device_info",
     "CheckpointManager",
     "ExperimentManager",
+    "validate_model_config",
+    "validate_dataset_config",
+    "validate_training_config",
     "load_image",
     "save_image",
     "save_json",
