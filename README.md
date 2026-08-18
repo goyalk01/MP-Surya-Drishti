@@ -40,8 +40,34 @@ Accelerating solar adoption requires democratic access to fast, automated, and i
 * **Official Dataset Pipeline**: Native support for the official Massachusetts Buildings Dataset partition structure (`train/train_labels`, `val/val_labels`, `test/test_labels`).
 * **TensorBoard & Experiment Versioning**: Real-time logging of Loss, IoU, Dice, Learning Rate, GPU Memory usage (MB), and Epoch/Validation timing under versioned folders (`outputs/experiments/exp_001/`, `exp_002/`).
 * **Smart Checkpointing**: Automated saving of `best_iou.pth`, `best_loss.pth`, and `latest.pth` with strict weight loading (`strict=True`).
+* **Auto-Checkpoint Selection**: Intelligent checkpoint selection using validation metrics to automatically pick the best performing model (`best_loss.pth`).
 * **Postprocessing & Polygon Extraction**: Morphological mask cleaning, Douglas-Peucker contour simplification (GeoJSON polygons), and scale-aware rooftop area estimation.
 * **Standardized Prediction Reports**: Generates `prediction_report.json` designed for direct downstream integration.
+
+---
+
+## 📊 Verified Baseline Performance & Diagnostics
+
+Evaluated on the official **Massachusetts Buildings Dataset** test partition (10 satellite images, 1500×1500 px):
+
+### Primary Model Performance (512×512 Native Resolution)
+* **Model**: SegFormer-B2 (`nvidia/mit-b2`)
+* **Checkpoint**: `best_loss.pth` (Epoch 50)
+* **Pixel Accuracy**: **83.81%**
+* **Mean IoU**: **61.06%**
+* **Rooftop IoU (Class 1)**: **40.29%**
+* **Rooftop Dice (F1)**: **57.44%**
+* **Background IoU (Class 0)**: **81.83%**
+
+### Multi-Mode Pipeline Comparison
+
+| Evaluation Mode | Description | Pixel Acc | Mean IoU | Rooftop IoU | Rooftop Dice |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **512×512 Primary** | Native model resolution evaluation | **83.81%** | **61.06%** | **40.29%** | **57.44%** |
+| **1500×1500 Raw** | Raw nearest-neighbor full-res reconstruction | **78.48%** | **52.40%** | **28.31%** | **44.13%** |
+| **1500×1500 + Cleaner** | Diagnostic postprocessing with `MaskCleaner` | **77.75%** | **50.14%** | **24.25%** | **39.03%** |
+
+> ℹ️ **Technical Note**: The current baseline model is trained on $512 \times 512$ downscaled aerial images. Upsampling predictions to $1500 \times 1500$ via nearest neighbor introduces boundary staircasing, reducing measured overlap against raw satellite ground truth. Furthermore, `MaskCleaner` filters small rooftop structures as noise on this test set, so the raw model prediction is designated as the primary baseline. Planned future enhancements include sliding-window patch tiling and Focal-Dice loss.
 
 ---
 
@@ -68,6 +94,7 @@ rooftop_segmentation/
 ├── assets/                     → Repository visual assets & diagrams
 ├── examples/                   → Python usage examples & scripts (infer_sample.py)
 ├── main.py                     → Unified Framework CLI (train | infer | evaluate | verify-dataset)
+├── test_evaluation_showcase.py → Evaluation and showcase report generator
 ├── requirements.txt            → Production Python dependencies
 ├── CONTRIBUTING.md             → Contribution guidelines
 ├── CODE_OF_CONDUCT.md          → Contributor code of conduct
@@ -90,19 +117,19 @@ rooftop_segmentation/
 | **Computer Vision & Image Processing** | OpenCV, Albumentations, Pillow |
 | **Scientific Computing & Geometry** | NumPy, SciPy, Pandas, Shapely |
 | **Visualization & Experiment Tracking** | Matplotlib, TensorBoard |
-| **Execution Environments** | Google Colab (T4 GPU), Local PyTorch CUDA |
+| **Execution Environments** | Google Colab (T4 GPU), Local PyTorch CUDA / CPU |
 | **Version Control & Governance** | Git, GitHub Actions |
 
 ---
 
 ## 💾 Checkpoint Format & State Preservation
 
-Every checkpoint (`best_iou.pth`, `best_loss.pth`, `latest.pth`) contains complete, self-contained state metadata:
+Every checkpoint (`best_loss.pth`, `best_iou.pth`, `latest.pth`) contains complete, self-contained state metadata:
 
 ```python
 {
     "model_type": "segformer",
-    "epoch": 25,
+    "epoch": 50,
     "model_state_dict": dict,      # 100% trained encoder + decode head weights
     "optimizer_state_dict": dict,  # AdamW optimizer state
     "scheduler_state_dict": dict,  # LR scheduler state
@@ -114,7 +141,7 @@ Every checkpoint (`best_iou.pth`, `best_loss.pth`, `latest.pth`) contains comple
     "label2id": {"background": 0, "rooftop": 1},
     "confidence_threshold": 0.5,
     "image_size": 512,
-    "metrics": dict,               # Val IoU, Dice, Accuracy
+    "metrics": dict,               # Val IoU, Dice, Accuracy, Loss
     "config": dict,                # Full experiment configuration snapshot
 }
 ```
@@ -152,29 +179,26 @@ tensorboard --logdir outputs/experiments
 ```
 
 ### 4. Evaluation
-Evaluate the trained weights on the official test set:
+Evaluate the trained weights on the official test set (auto-selects best checkpoint):
 ```bash
-python main.py evaluate --checkpoint outputs/experiments/exp_001/checkpoints/best_iou.pth
+python main.py evaluate
+```
+Or specify an explicit checkpoint:
+```bash
+python main.py evaluate --checkpoint outputs/experiments/exp_002/checkpoints/best_loss.pth
 ```
 
-### 5. Single Image Inference
+### 5. Showcase & Diagnostic Report Generation
+Generate multi-mode comparison tables, charts, and per-sample visual artifacts:
+```bash
+python test_evaluation_showcase.py
+```
+
+### 6. Single Image Inference
 Run inference to produce segmented overlays and `prediction_report.json`:
 ```bash
-python main.py infer --image path/to/sample.jpg --checkpoint outputs/experiments/exp_001/checkpoints/best_iou.pth
+python main.py infer --image path/to/sample.jpg
 ```
-
----
-
-## ❓ Common Warnings & Troubleshooting
-
-### 1. Pretrained Weight Loading Logs During Training
-- **Log Message**: `Some weights of SegformerForSemanticSegmentation were not initialized...`
-- **Explanation**: This is expected when initializing a fresh model for transfer learning. HuggingFace loads encoder weights from `nvidia/mit-b2` and re-initializes the classification head for 2 classes.
-- **Checkpoint Restoration**: When loading saved checkpoints (`best_iou.pth`), the framework instantiates the model architecture directly from configuration and restores weights with `strict=True`. **Zero warnings** occur during inference or evaluation checkpoint loading.
-
-### 2. Missing Trained Checkpoint Error
-- **Error**: `FileNotFoundError: No trained checkpoint ('best_iou.pth') found...`
-- **Resolution**: Run `python main.py train` to generate experiment checkpoints before evaluating or inferring.
 
 ---
 

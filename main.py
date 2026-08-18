@@ -19,6 +19,7 @@ from pathlib import Path
 
 import yaml
 
+from utils.checkpoint_manager import find_best_available_checkpoint
 from utils.config_validator import (
     validate_dataset_config,
     validate_model_config,
@@ -34,39 +35,6 @@ def load_config(config_path: str) -> dict:
         raise FileNotFoundError(f"Configuration file not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
-
-def find_default_checkpoint() -> Path:
-    """
-    Find the latest trained best_iou.pth checkpoint across experiment directories.
-
-    Returns:
-        Path to best_iou.pth file.
-
-    Raises:
-        FileNotFoundError: If no trained checkpoint is found.
-    """
-    candidates = [
-        Path("models/checkpoints/best_iou.pth"),
-        Path("outputs/checkpoints/best_iou.pth"),
-    ]
-
-    # Look in experiments
-    exp_dir = Path("outputs/experiments")
-    if exp_dir.exists():
-        for exp in sorted(exp_dir.glob("exp_*"), reverse=True):
-            ckpt = exp / "checkpoints" / "best_iou.pth"
-            if ckpt.exists():
-                return ckpt
-
-    for cand in candidates:
-        if cand.exists():
-            return cand
-
-    raise FileNotFoundError(
-        "No trained checkpoint ('best_iou.pth') found. "
-        "Please run training first using: python main.py train"
-    )
 
 
 def cmd_train(args: argparse.Namespace) -> None:
@@ -213,10 +181,10 @@ def cmd_infer(args: argparse.Namespace) -> None:
     image_size = model_cfg.get("image_size", 512)
 
     # Determine checkpoint path
-    checkpoint_path = Path(args.checkpoint)
+    checkpoint_path = Path(args.checkpoint) if args.checkpoint else find_best_available_checkpoint()
     if not checkpoint_path.exists():
-        checkpoint_path = find_default_checkpoint()
-        logger.info("Using auto-detected checkpoint: %s", checkpoint_path)
+        checkpoint_path = find_best_available_checkpoint()
+    logger.info("Using checkpoint: %s", checkpoint_path)
 
     inferencer = SegmentationInferencer(
         checkpoint_path=checkpoint_path,
@@ -286,10 +254,10 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     ensure_models_registered()
 
     # Determine checkpoint path
-    checkpoint_path = Path(args.checkpoint)
+    checkpoint_path = Path(args.checkpoint) if args.checkpoint else find_best_available_checkpoint()
     if not checkpoint_path.exists():
-        checkpoint_path = find_default_checkpoint()
-        logger.info("Using auto-detected checkpoint: %s", checkpoint_path)
+        checkpoint_path = find_best_available_checkpoint()
+    logger.info("Selected checkpoint: %s", checkpoint_path)
 
     device = get_device()
     logger.info("Loading trained weights from checkpoint: %s", checkpoint_path)
@@ -326,20 +294,47 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 
     results = metrics.compute()
     output_dir = Path(args.output_dir)
-    save_json(results, output_dir / "evaluation_results.json")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n" + "=" * 50)
-    print("  EVALUATION RESULTS")
-    print("=" * 50)
-    print(f"  Checkpoint Loaded: {checkpoint_path}")
-    print(f"  Test Samples:      {len(test_dataset)}")
-    print(f"  Mean IoU:          {results['iou']:.4f}")
-    print(f"  Rooftop IoU:       {results['rooftop_iou']:.4f}")
-    print(f"  Mean Dice:         {results['dice']:.4f}")
-    print(f"  Rooftop Dice:      {results['rooftop_dice']:.4f}")
-    print(f"  Pixel Accuracy:    {results['pixel_accuracy']:.4f}")
-    print(f"  Results saved:     {output_dir / 'evaluation_results.json'}")
-    print("=" * 50 + "\n")
+    # Read checkpoint metadata
+    ckpt_raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    epoch = ckpt_raw.get("epoch", -1)
+
+    eval_payload = {
+        "checkpoint": str(checkpoint_path),
+        "epoch": epoch,
+        "dataset": "Massachusetts Buildings Dataset",
+        "split": "test",
+        "num_samples": len(test_dataset),
+        "model_type": getattr(model, "model_type", "segformer"),
+        "backbone": getattr(model, "backbone_name", model_cfg.get("backbone", "nvidia/mit-b2")),
+        "image_size": model_cfg.get("image_size", 512),
+        "primary_evaluation": {
+            "pixel_accuracy": round(results["pixel_accuracy"], 4),
+            "mean_iou": round(results["iou"], 4),
+            "rooftop_iou": round(results["rooftop_iou"], 4),
+            "rooftop_dice": round(results["rooftop_dice"], 4),
+            "background_iou": round(results["iou_per_class"][0], 4) if len(results["iou_per_class"]) > 0 else 0.0,
+        },
+    }
+
+    save_json(eval_payload, output_dir / "evaluation_results.json")
+
+    print("\n" + "=" * 60)
+    print("  MP SURYA-DRISHTI — EVALUATION RESULTS")
+    print("=" * 60)
+    print(f"  Checkpoint Loaded : {checkpoint_path}")
+    print(f"  Epoch             : {epoch}")
+    print(f"  Test Samples      : {len(test_dataset)}")
+    print(f"  Evaluation Mode   : Native Model Resolution (512x512)")
+    print("-" * 60)
+    print(f"  Pixel Accuracy    : {results['pixel_accuracy'] * 100:.2f}%")
+    print(f"  Mean IoU          : {results['iou'] * 100:.2f}%")
+    print(f"  Rooftop IoU       : {results['rooftop_iou'] * 100:.2f}%")
+    print(f"  Rooftop Dice      : {results['rooftop_dice'] * 100:.2f}%")
+    print("-" * 60)
+    print(f"  Results saved to  : {output_dir / 'evaluation_results.json'}")
+    print("=" * 60 + "\n")
 
 
 def cmd_verify_dataset(args: argparse.Namespace) -> None:
@@ -430,14 +425,14 @@ def main() -> None:
     # Infer
     infer_parser = subparsers.add_parser("infer", help="Run inference")
     infer_parser.add_argument("--image", required=True, help="Input image path")
-    infer_parser.add_argument("--checkpoint", default="models/checkpoints/best_iou.pth")
+    infer_parser.add_argument("--checkpoint", default=None, help="Path to checkpoint (auto-selects best if omitted)")
     infer_parser.add_argument("--output-dir", default="outputs/predictions")
     infer_parser.add_argument("--model-config", default="configs/model_config.yaml")
     infer_parser.add_argument("--dataset-config", default="configs/dataset_config.yaml")
 
     # Evaluate
     eval_parser = subparsers.add_parser("evaluate", help="Evaluate model")
-    eval_parser.add_argument("--checkpoint", default="models/checkpoints/best_iou.pth")
+    eval_parser.add_argument("--checkpoint", default=None, help="Path to checkpoint (auto-selects best if omitted)")
     eval_parser.add_argument("--output-dir", default="outputs/reports")
     eval_parser.add_argument("--model-config", default="configs/model_config.yaml")
     eval_parser.add_argument("--dataset-config", default="configs/dataset_config.yaml")
