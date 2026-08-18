@@ -32,3 +32,27 @@ model:
 
   # Confidence threshold for binary mask generation
   confidence_threshold: 0.5
+
+  # Native-Resolution Tiling Strategy
+  tiling:
+    strategy: "tiled"           # "tiled" (native resolution crops) or "full_image" (resize)
+    tile_size: 512              # Square patch size
+    stride: 256                 # 50% overlap for boundary reconstruction
+
+  # Sliding-Window Inference Settings
+  tiled_inference:
+    enabled: true               # Use sliding-window inference at original resolution
+    tile_size: 512              # Window tile size
+    stride: 256                 # 50% overlap
+    batch_size: 8               # Parallel tiles per forward pass
+    blend_mode: "gaussian"      # "gaussian" or "uniform"
+
+  # Test-Time Augmentation (TTA)
+  tta:
+    enabled: false              # Isometric transforms (H-flip, V-flip, rot90)
+
+  # Postprocessing Configuration
+  postprocessing:
+    cleaner:
+      enabled: false            # Morphological cleaner (diagnostic only, raw prediction remains primary)
+      min_region_area: 10       # Minimum connected component area in pixels

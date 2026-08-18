@@ -11,6 +11,7 @@ from utils.config_validator import (
     validate_dataset_config,
     validate_training_config,
 )
+from utils.class_imbalance import compute_training_class_imbalance
 from utils.io_utils import load_image, save_image, save_json, load_json
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "print_device_info",
     "CheckpointManager",
     "find_best_available_checkpoint",
+    "compute_training_class_imbalance",
     "ExperimentManager",
     "validate_model_config",
     "validate_dataset_config",

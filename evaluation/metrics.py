@@ -52,28 +52,43 @@ class SegmentationMetrics:
 
     def update(
         self,
-        predictions: torch.Tensor,
-        targets: torch.Tensor,
+        predictions: torch.Tensor | np.ndarray,
+        targets: torch.Tensor | np.ndarray,
     ) -> None:
         """
-        Update the confusion matrix with a batch of predictions.
+        Update the confusion matrix with a batch or single pair of predictions.
 
         Args:
-            predictions: Predicted labels (B, H, W) with class indices.
-            targets: Ground truth labels (B, H, W) with class indices.
+            predictions: Predicted labels (B, H, W) or (H, W) as Tensor or ndarray.
+            targets: Ground truth labels (B, H, W) or (H, W) as Tensor or ndarray.
         """
-        preds = predictions.cpu().numpy().flatten()
-        tgts = targets.cpu().numpy().flatten()
+        if isinstance(predictions, torch.Tensor):
+            preds = predictions.detach().cpu().numpy().flatten()
+        else:
+            preds = np.asarray(predictions).flatten()
 
-        # Filter out ignored pixels
-        mask = tgts != self.ignore_index
-        preds = preds[mask]
-        tgts = tgts[mask]
+        if isinstance(targets, torch.Tensor):
+            tgts = targets.detach().cpu().numpy().flatten()
+        else:
+            tgts = np.asarray(targets).flatten()
 
-        # Update confusion matrix
-        for t, p in zip(tgts, preds):
-            if 0 <= t < self.num_classes and 0 <= p < self.num_classes:
-                self.confusion_matrix[t, p] += 1
+        # Filter out ignored pixels and out-of-bound indices
+        valid = (
+            (tgts != self.ignore_index)
+            & (tgts >= 0)
+            & (tgts < self.num_classes)
+            & (preds >= 0)
+            & (preds < self.num_classes)
+        )
+        preds = preds[valid].astype(np.int64)
+        tgts = tgts[valid].astype(np.int64)
+
+        if len(tgts) > 0:
+            cm_update = np.bincount(
+                self.num_classes * tgts + preds,
+                minlength=self.num_classes**2,
+            ).reshape(self.num_classes, self.num_classes)
+            self.confusion_matrix += cm_update
 
     def compute(self) -> dict[str, float]:
         """

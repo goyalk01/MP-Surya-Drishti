@@ -1,19 +1,20 @@
 """
-MP Surya-Drishti — Model Test Evaluation & Showcase Report Generator
-====================================================================
+MP Surya-Drishti — Model Test Evaluation & Scientific Showcase Report Generator
+================================================================================
 
-This script evaluates trained segmentation models on the official test set and produces:
-  1. Primary Model Performance: Native model resolution (512x512)
-  2. Full-Resolution Raw Diagnostic: 1500x1500 raw reconstruction without cleaner
-  3. Full-Resolution Postprocessed Diagnostic: 1500x1500 with MaskCleaner
-  4. Per-image side-by-side comparison images, raw masks, and overlays
-  5. Multi-evaluation pipeline comparison charts and confusion matrices
-  6. Standardized JSON metrics artifacts
+Evaluates trained segmentation models on the official Massachusetts test set and produces:
+  1. Primary Model Performance: Native model resolution (512x512 single pass)
+  2. Native-Resolution Tiled Inference: Sliding-window (512x512 tiles, stride 256, Gaussian blend)
+  3. Native-Resolution TTA: Sliding-window + Test-Time Augmentation (flips + rot90)
+  4. Diagnostic Postprocessing: Sliding-window + MaskCleaner (min_region_area=10)
+  5. 5-Panel Visual Debug Figures: Original, Ground Truth, Single-Pass, Tiled, Error Map
+  6. Tile Grid Overlay Visualization: Illustrating native 512x512 sliding window over 1500x1500
+  7. Multi-pipeline comparison charts, per-image IoU distributions, and confusion matrices
+  8. Standardized JSON metrics artifacts
 
 Usage:
     python test_evaluation_showcase.py
     python test_evaluation_showcase.py --checkpoint outputs/experiments/exp_002/checkpoints/best_loss.pth
-    python test_evaluation_showcase.py --checkpoint outputs/experiments/exp_002/checkpoints/best_iou.pth
 """
 
 from __future__ import annotations
@@ -34,17 +35,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.amp import autocast
 
-# ── Framework Imports ──────────────────────────────────────────────
-from models.registry import ensure_models_registered, load_model_from_checkpoint
-from preprocessing.normalizer import ImageNormalizer
-from preprocessing.dataset_loader import MassachusettsDataset
-from preprocessing.augmentation import AugmentationPipeline
 from evaluation.metrics import SegmentationMetrics
+from inference.inferencer import SegmentationInferencer, generate_gaussian_weight_map
+from models.registry import ensure_models_registered, load_model_from_checkpoint
+from postprocessing.area_estimator import AreaEstimator
 from postprocessing.mask_cleaner import MaskCleaner
 from postprocessing.polygon_extractor import PolygonExtractor
-from postprocessing.area_estimator import AreaEstimator
+from preprocessing.augmentation import AugmentationPipeline
+from preprocessing.dataset_loader import MassachusettsDataset
+from preprocessing.tiled_dataset import generate_tile_coordinates
 from utils.checkpoint_manager import find_best_available_checkpoint
 from utils.device_utils import get_device
 
@@ -93,222 +93,169 @@ def create_colored_overlay(
     return overlay
 
 
+def compute_error_difference_map(
+    ground_truth: np.ndarray,
+    prediction: np.ndarray,
+) -> np.ndarray:
+    """
+    Generate an RGB error difference map.
+    - True Positive (TP): Green (0, 220, 0)
+    - False Positive (FP): Red (230, 40, 40)
+    - False Negative (FN): Blue (40, 100, 230)
+    - True Negative (TN): Dark Gray (30, 30, 30)
+    """
+    h, w = ground_truth.shape[:2]
+    diff = np.full((h, w, 3), 30, dtype=np.uint8)
+
+    tp = (prediction == 1) & (ground_truth == 1)
+    fp = (prediction == 1) & (ground_truth == 0)
+    fn = (prediction == 0) & (ground_truth == 1)
+
+    diff[tp] = [0, 220, 0]      # Green = Correct Detection
+    diff[fp] = [230, 40, 40]    # Red = False Alarm
+    diff[fn] = [40, 100, 230]   # Blue = Missed Rooftop
+
+    return diff
+
+
 # ══════════════════════════════════════════════════════════════════
 #  Visualization Generators
 # ══════════════════════════════════════════════════════════════════
 
-def save_comparison_figure(
+def save_5panel_debug_figure(
     original: np.ndarray,
     ground_truth: np.ndarray,
-    prediction_raw: np.ndarray,
-    overlay: np.ndarray,
-    primary_metrics: dict[str, float],
-    fullres_metrics: dict[str, float],
+    pred_single: np.ndarray,
+    pred_tiled: np.ndarray,
+    error_map: np.ndarray,
+    single_iou: float,
+    tiled_iou: float,
     save_path: Path,
     image_name: str,
 ) -> None:
-    """Save a professional 4-panel comparison figure with raw model prediction."""
-    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+    """Save a comprehensive 5-panel debug comparison figure."""
+    fig, axes = plt.subplots(1, 5, figsize=(25, 6))
 
-    axes[0, 0].imshow(original)
-    axes[0, 0].set_title("Original Satellite Image (1500×1500)", fontsize=13, fontweight="bold")
-    axes[0, 0].axis("off")
+    axes[0].imshow(original)
+    axes[0].set_title("Original Satellite (1500×1500)", fontsize=11, fontweight="bold")
+    axes[0].axis("off")
 
-    axes[0, 1].imshow(ground_truth, cmap="gray", vmin=0, vmax=1)
-    axes[0, 1].set_title("Ground Truth Rooftop Mask", fontsize=13, fontweight="bold")
-    axes[0, 1].axis("off")
+    axes[1].imshow(ground_truth, cmap="gray", vmin=0, vmax=1)
+    axes[1].set_title("Ground Truth Mask", fontsize=11, fontweight="bold")
+    axes[1].axis("off")
 
-    axes[1, 0].imshow(prediction_raw, cmap="gray", vmin=0, vmax=1)
-    axes[1, 0].set_title("Predicted Rooftop Mask (Raw Model Output)", fontsize=13, fontweight="bold")
-    axes[1, 0].axis("off")
+    axes[2].imshow(pred_single, cmap="gray", vmin=0, vmax=1)
+    axes[2].set_title(f"Single-Pass 512 (IoU: {single_iou*100:.1f}%)", fontsize=11, fontweight="bold")
+    axes[2].axis("off")
 
-    axes[1, 1].imshow(overlay)
-    axes[1, 1].set_title("Raw Prediction Overlay", fontsize=13, fontweight="bold")
-    axes[1, 1].axis("off")
+    axes[3].imshow(pred_tiled, cmap="gray", vmin=0, vmax=1)
+    axes[3].set_title(f"Tiled Native-Res (IoU: {tiled_iou*100:.1f}%)", fontsize=11, fontweight="bold")
+    axes[3].axis("off")
 
-    metric_text = (
-        f"Primary (512×512) — IoU: {primary_metrics['iou']:.4f} | Dice: {primary_metrics['dice']:.4f} | Acc: {primary_metrics['pixel_accuracy']:.4f}\n"
-        f"Full-Res (1500×1500 Raw) — IoU: {fullres_metrics['iou']:.4f} | Dice: {fullres_metrics['dice']:.4f} | Acc: {fullres_metrics['pixel_accuracy']:.4f}"
-    )
-    fig.suptitle(
-        f"MP Surya-Drishti — Rooftop Segmentation\nSample: {image_name}\n{metric_text}",
+    axes[4].imshow(error_map)
+    axes[4].set_title("Tiled Error Map\n(TP:Grn, FP:Red, FN:Blu)", fontsize=11, fontweight="bold")
+    axes[4].axis("off")
+
+    plt.suptitle(
+        f"MP Surya-Drishti Diagnostic — {image_name}",
         fontsize=14,
         fontweight="bold",
         y=0.98,
     )
-
-    plt.tight_layout(rect=[0, 0, 1, 0.93])
-    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
 
 
-def save_diagnostic_comparison_figure(
-    original: np.ndarray,
-    ground_truth: np.ndarray,
-    prediction_raw: np.ndarray,
-    prediction_cleaned: np.ndarray,
-    raw_iou: float,
-    cleaned_iou: float,
+def save_tile_grid_visualization(
+    image: np.ndarray,
+    coords: list[tuple[int, int, int, int]],
     save_path: Path,
-    image_name: str,
 ) -> None:
-    """Save a 4-panel diagnostic comparison contrasting Raw vs MaskCleaner."""
-    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+    """Save satellite image with overlaid tile grid illustrating native tiling."""
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(image)
 
-    axes[0, 0].imshow(original)
-    axes[0, 0].set_title("Original Satellite Image", fontsize=13, fontweight="bold")
-    axes[0, 0].axis("off")
-
-    axes[0, 1].imshow(ground_truth, cmap="gray", vmin=0, vmax=1)
-    axes[0, 1].set_title("Ground Truth Mask", fontsize=13, fontweight="bold")
-    axes[0, 1].axis("off")
-
-    axes[1, 0].imshow(prediction_raw, cmap="gray", vmin=0, vmax=1)
-    axes[1, 0].set_title(f"Raw Model Prediction (IoU: {raw_iou:.4f})", fontsize=13, fontweight="bold")
-    axes[1, 0].axis("off")
-
-    axes[1, 1].imshow(prediction_cleaned, cmap="gray", vmin=0, vmax=1)
-    axes[1, 1].set_title(f"Postprocessed Diagnostic — MaskCleaner (IoU: {cleaned_iou:.4f})", fontsize=13, fontweight="bold")
-    axes[1, 1].axis("off")
-
-    fig.suptitle(
-        f"MP Surya-Drishti — Diagnostic Comparison: Raw vs MaskCleaner\nSample: {image_name}",
-        fontsize=15,
-        fontweight="bold",
-        y=0.98,
-    )
-
-    plt.tight_layout(rect=[0, 0, 1, 0.94])
-    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
-
-
-def save_metrics_bar_chart(
-    primary_metrics: dict[str, Any],
-    save_path: Path,
-    model_name: str = "SegFormer-B2",
-) -> None:
-    """Save a bar chart of primary model metrics (512x512)."""
-    metric_names = [
-        "Pixel Accuracy",
-        "Mean IoU",
-        "Rooftop IoU",
-        "Rooftop Dice",
-        "Background IoU",
-    ]
-    metric_values = [
-        primary_metrics["pixel_accuracy"],
-        primary_metrics["mean_iou"],
-        primary_metrics["rooftop_iou"],
-        primary_metrics["rooftop_dice"],
-        primary_metrics.get("background_iou", primary_metrics.get("iou_per_class", [0.0, 0.0])[0]),
-    ]
-
-    colors = ["#9C27B0", "#2196F3", "#FF9800", "#4CAF50", "#607D8B"]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bars = ax.bar(metric_names, metric_values, color=colors, width=0.55, edgecolor="white", linewidth=1.5)
-
-    for bar, val in zip(bars, metric_values):
+    for i, (x1, y1, x2, y2) in enumerate(coords):
+        rect = plt.Rectangle(
+            (x1, y1),
+            x2 - x1,
+            y2 - y1,
+            fill=False,
+            edgecolor="#00FFCC",
+            linewidth=1.2,
+            linestyle="--",
+            alpha=0.8,
+        )
+        ax.add_patch(rect)
         ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + 0.015,
-            f"{val * 100:.2f}%",
-            ha="center",
-            va="bottom",
-            fontsize=11,
+            x1 + 15,
+            y1 + 35,
+            f"T{i+1}",
+            color="#FFFFFF",
+            fontsize=9,
             fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="#000000", alpha=0.6),
         )
 
-    ax.set_ylim(0, 1.10)
-    ax.set_ylabel("Score", fontsize=12)
     ax.set_title(
-        f"MP Surya-Drishti — Primary Model Performance ({model_name} @ 512×512)",
-        fontsize=14,
+        f"Sliding-Window Native Tiling Grid ({len(coords)} tiles, 512×512, stride 256)",
+        fontsize=13,
         fontweight="bold",
     )
-    ax.grid(axis="y", alpha=0.3)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
+    ax.axis("off")
     plt.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
 def save_pipeline_comparison_chart(
-    primary_metrics: dict[str, Any],
-    fullres_raw_metrics: dict[str, Any],
-    fullres_clean_metrics: dict[str, Any],
+    mode_a: dict[str, float],
+    mode_b: dict[str, float],
+    mode_c: dict[str, float],
+    mode_d: dict[str, float],
     save_path: Path,
 ) -> None:
-    """Save a multi-bar chart comparing the 3 evaluation modes."""
-    modes = [
-        "Primary (512×512)",
-        "1500×1500 Raw",
-        "1500×1500 + Cleaner",
-    ]
+    """Save 4-mode comparative bar chart across pipelines."""
+    labels = ["Pixel Acc", "Mean IoU", "Rooftop IoU", "Rooftop Dice"]
+    metrics_a = [mode_a["pixel_accuracy"], mode_a["mean_iou"], mode_a["rooftop_iou"], mode_a["rooftop_dice"]]
+    metrics_b = [mode_b["pixel_accuracy"], mode_b["mean_iou"], mode_b["rooftop_iou"], mode_b["rooftop_dice"]]
+    metrics_c = [mode_c["pixel_accuracy"], mode_c["mean_iou"], mode_c["rooftop_iou"], mode_c["rooftop_dice"]]
+    metrics_d = [mode_d["pixel_accuracy"], mode_d["mean_iou"], mode_d["rooftop_iou"], mode_d["rooftop_dice"]]
 
-    roof_iou = [
-        primary_metrics["rooftop_iou"] * 100,
-        fullres_raw_metrics["rooftop_iou"] * 100,
-        fullres_clean_metrics["rooftop_iou"] * 100,
-    ]
-    roof_dice = [
-        primary_metrics["rooftop_dice"] * 100,
-        fullres_raw_metrics["rooftop_dice"] * 100,
-        fullres_clean_metrics["rooftop_dice"] * 100,
-    ]
-    mean_iou = [
-        primary_metrics["mean_iou"] * 100,
-        fullres_raw_metrics["mean_iou"] * 100,
-        fullres_clean_metrics["mean_iou"] * 100,
-    ]
-    accuracy = [
-        primary_metrics["pixel_accuracy"] * 100,
-        fullres_raw_metrics["pixel_accuracy"] * 100,
-        fullres_clean_metrics["pixel_accuracy"] * 100,
-    ]
-
-    x = np.arange(len(modes))
+    x = np.arange(len(labels))
     width = 0.20
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(13, 7))
+    r1 = ax.bar(x - 1.5 * width, [v * 100 for v in metrics_a], width, label="A: 512×512 Baseline", color="#4A90E2", alpha=0.9)
+    r2 = ax.bar(x - 0.5 * width, [v * 100 for v in metrics_b], width, label="B: Tiled Native (512, s256)", color="#2ECC71", alpha=0.9)
+    r3 = ax.bar(x + 0.5 * width, [v * 100 for v in metrics_c], width, label="C: Tiled + TTA", color="#F39C12", alpha=0.9)
+    r4 = ax.bar(x + 1.5 * width, [v * 100 for v in metrics_d], width, label="D: Tiled + Cleaner", color="#9B59B6", alpha=0.9)
 
-    b1 = ax.bar(x - 1.5 * width, roof_iou, width, label="Rooftop IoU", color="#FF9800")
-    b2 = ax.bar(x - 0.5 * width, roof_dice, width, label="Rooftop Dice", color="#4CAF50")
-    b3 = ax.bar(x + 0.5 * width, mean_iou, width, label="Mean IoU", color="#2196F3")
-    b4 = ax.bar(x + 1.5 * width, accuracy, width, label="Pixel Accuracy", color="#9C27B0")
+    ax.set_ylabel("Score (%)", fontsize=12, fontweight="bold")
+    ax.set_title("MP Surya-Drishti — Multi-Mode Evaluation Matrix", fontsize=14, fontweight="bold", pad=15)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=11, fontweight="bold")
+    ax.legend(fontsize=10, loc="upper right")
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.set_ylim(0, 105)
 
-    for bar_group in [b1, b2, b3, b4]:
-        for bar in bar_group:
-            h = bar.get_height()
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                h + 1.0,
-                f"{h:.1f}%",
+    for rects in [r1, r2, r3, r4]:
+        for rect in rects:
+            height = rect.get_height()
+            ax.annotate(
+                f"{height:.1f}%",
+                xy=(rect.get_x() + rect.get_width() / 2, height),
+                xytext=(0, 3),
+                textcoords="offset points",
                 ha="center",
                 va="bottom",
-                fontsize=9,
+                fontsize=8,
                 fontweight="bold",
             )
 
-    ax.set_ylabel("Percentage (%)", fontsize=12)
-    ax.set_title(
-        "MP Surya-Drishti — Evaluation Mode Comparison\n(Primary vs Full-Resolution Diagnostics)",
-        fontsize=14,
-        fontweight="bold",
-    )
-    ax.set_xticks(x)
-    ax.set_xticklabels(modes, fontsize=11, fontweight="bold")
-    ax.set_ylim(0, 105)
-    ax.legend(loc="upper right", framealpha=0.9)
-    ax.grid(axis="y", alpha=0.3)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
     plt.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -316,90 +263,106 @@ def save_per_image_iou_chart(
     per_image_results: list[dict[str, Any]],
     save_path: Path,
 ) -> None:
-    """Save a horizontal bar chart showing per-image Primary Rooftop IoU scores."""
-    names = [r["image_name"] for r in per_image_results]
-    ious = [r["primary_metrics"]["rooftop_iou"] * 100 for r in per_image_results]
+    """Save bar chart showing per-image rooftop IoU."""
+    names = [r["image_name"].replace(".png", "") for r in per_image_results]
+    iou_a = [r["single_metrics"]["rooftop_iou"] * 100 for r in per_image_results]
+    iou_b = [r["tiled_metrics"]["rooftop_iou"] * 100 for r in per_image_results]
 
-    sorted_pairs = sorted(zip(names, ious), key=lambda x: x[1], reverse=True)
-    names, ious = zip(*sorted_pairs)
+    x = np.arange(len(names))
+    width = 0.4
 
-    fig, ax = plt.subplots(figsize=(10, max(6, len(names) * 0.5)))
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.bar(x - width/2, iou_a, width, label="Single-Pass Baseline", color="#4A90E2", alpha=0.85)
+    ax.bar(x + width/2, iou_b, width, label="Tiled Native Resolution", color="#2ECC71", alpha=0.85)
 
-    colors = ["#4CAF50" if v >= 40.0 else "#FF9800" if v >= 25.0 else "#F44336" for v in ious]
-    bars = ax.barh(range(len(names)), ious, color=colors, height=0.55)
-
-    for i, (bar, val) in enumerate(zip(bars, ious)):
-        ax.text(val + 0.8, i, f"{val:.2f}%", va="center", fontsize=10, fontweight="bold")
-
-    ax.set_yticks(range(len(names)))
-    ax.set_yticklabels(names, fontsize=10)
-    ax.set_xlim(0, 105)
-    ax.set_xlabel("Primary Rooftop IoU (%)", fontsize=12)
-    ax.set_title(
-        "MP Surya-Drishti — Per-Image Primary Rooftop IoU (512×512)",
-        fontsize=14,
-        fontweight="bold",
-    )
-    ax.invert_yaxis()
-    ax.grid(axis="x", alpha=0.3)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    ax.set_ylabel("Rooftop IoU (%)", fontsize=11, fontweight="bold")
+    ax.set_title("Per-Image Rooftop IoU Comparison on Test Set", fontsize=13, fontweight="bold", pad=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=45, ha="right", fontsize=9)
+    ax.legend(fontsize=10)
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
 
     plt.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_metrics_bar_chart(
+    metrics: dict[str, float],
+    save_path: Path,
+    model_name: str = "SegFormer-B2",
+) -> None:
+    """Save single-model primary metrics bar chart."""
+    labels = ["Pixel Acc", "Mean IoU", "Rooftop IoU", "Rooftop Dice", "Background IoU"]
+    keys = ["pixel_accuracy", "mean_iou", "rooftop_iou", "rooftop_dice", "background_iou"]
+    values = [metrics.get(k, 0.0) * 100 for k in keys]
+    colors = ["#2ECC71", "#3498DB", "#E74C3C", "#9B59B6", "#1ABC9C"]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(labels, values, color=colors, width=0.55, edgecolor="#333333", linewidth=1.2)
+    ax.set_ylabel("Score (%)", fontsize=12, fontweight="bold")
+    ax.set_title(f"Primary Benchmark Performance — {model_name}", fontsize=14, fontweight="bold", pad=15)
+    ax.set_ylim(0, 105)
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+    for bar in bars:
+        height = bar.get_height()
+        ax.annotate(
+            f"{height:.2f}%",
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 4),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+        )
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
 def save_confusion_matrix_chart(
-    confusion_matrix: np.ndarray,
+    cm: np.ndarray,
     save_path: Path,
-    title_suffix: str = "Primary (512×512)",
+    title_suffix: str = "Primary",
 ) -> None:
-    """Save a normalized confusion matrix heatmap."""
+    """Save normalized confusion matrix heatmap."""
+    cm_norm = cm.astype(np.float64) / np.maximum(cm.sum(axis=1, keepdims=True), 1e-7)
+
     fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(cm_norm, interpolation="nearest", cmap="Blues", vmin=0, vmax=1)
+    ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    cm_normalized = confusion_matrix.astype(float)
-    row_sums = cm_normalized.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0] = 1
-    cm_percent = cm_normalized / row_sums * 100
-
-    im = ax.imshow(cm_percent, cmap="Blues", vmin=0, vmax=100)
-    plt.colorbar(im, label="Percentage (%)")
-
-    labels = ["Background", "Rooftop"]
-    ax.set_xticks([0, 1])
-    ax.set_yticks([0, 1])
-    ax.set_xticklabels(labels, fontsize=12)
-    ax.set_yticklabels(labels, fontsize=12)
-    ax.set_xlabel("Predicted", fontsize=12)
-    ax.set_ylabel("Ground Truth", fontsize=12)
-
-    for i in range(2):
-        for j in range(2):
-            count = int(confusion_matrix[i, j])
-            pct = cm_percent[i, j]
-            ax.text(
-                j, i,
-                f"{count:,}\n({pct:.1f}%)",
-                ha="center", va="center",
-                fontsize=11,
-                fontweight="bold",
-                color="white" if pct > 50 else "black",
-            )
-
-    ax.set_title(
-        f"Confusion Matrix — {title_suffix}",
-        fontsize=14,
-        fontweight="bold",
+    classes = ["Background", "Rooftop"]
+    ax.set(
+        xticks=np.arange(cm.shape[1]),
+        yticks=np.arange(cm.shape[0]),
+        xticklabels=classes,
+        yticklabels=classes,
+        title=f"Normalized Confusion Matrix ({title_suffix})",
+        ylabel="True Label",
+        xlabel="Predicted Label",
     )
 
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            val = cm_norm[i, j] * 100
+            raw = cm[i, j]
+            color = "white" if cm_norm[i, j] > 0.5 else "black"
+            ax.text(
+                j, i, f"{val:.1f}%\n({raw:,})",
+                ha="center", va="center", color=color, fontsize=10, fontweight="bold",
+            )
+
     plt.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  Main Evaluation Execution Engine
+#  Evaluation Showcase Runner
 # ══════════════════════════════════════════════════════════════════
 
 def run_evaluation_showcase(
@@ -407,444 +370,240 @@ def run_evaluation_showcase(
     dataset_root: str | Path = "datasets/massachusetts",
     output_base_dir: str | Path = "outputs",
     image_size: int = 512,
+    tile_stride: int = 256,
+    eval_tta: bool = False,
 ) -> dict[str, Any]:
-    """
-    Execute complete test evaluation and showcase report generation.
+    """Execute evaluation across the 4 experimental modes."""
+    device = get_device()
+    output_dir = Path(output_base_dir)
+    images_dir = output_dir / "images"
+    charts_dir = output_dir / "charts"
 
-    Args:
-        checkpoint_path: Explicit checkpoint path. If None, auto-selects best via validation metrics.
-        dataset_root: Root path to Massachusetts dataset.
-        output_base_dir: Base output directory.
-        image_size: Input resolution (default 512).
-
-    Returns:
-        Dictionary containing all dynamically computed metrics and report paths.
-    """
-    dataset_root = Path(dataset_root)
-    test_images_dir = dataset_root / "test"
-    test_masks_dir = dataset_root / "test_labels"
-
-    if not test_images_dir.exists():
-        raise FileNotFoundError(f"Test images directory not found: {test_images_dir}")
+    images_dir.mkdir(parents=True, exist_ok=True)
+    charts_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Resolve Checkpoint
     if checkpoint_path is None:
         resolved_checkpoint = find_best_available_checkpoint()
     else:
         resolved_checkpoint = Path(checkpoint_path)
-        if not resolved_checkpoint.exists():
-            raise FileNotFoundError(f"Specified checkpoint not found: {resolved_checkpoint}")
 
-    # 2. Output directory setup
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(output_base_dir) / f"test_evaluation_outputs_{timestamp}"
-    images_dir = output_dir / "images"
-    charts_dir = output_dir / "charts"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    charts_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Evaluating Checkpoint: %s on device: %s", resolved_checkpoint, device)
 
-    logger.info("Evaluation output directory: %s", output_dir)
-    logger.info("Evaluating checkpoint: %s", resolved_checkpoint)
-
-    # 3. Read Checkpoint Metadata
-    device = get_device()
-    ckpt_raw = torch.load(resolved_checkpoint, map_location="cpu", weights_only=False)
-    epoch = ckpt_raw.get("epoch", -1)
-    model_type = ckpt_raw.get("model_type", "segformer")
-    backbone = ckpt_raw.get("backbone", "nvidia/mit-b2")
-
-    checkpoint_info = {
-        "checkpoint_path": str(resolved_checkpoint),
-        "model_type": model_type,
-        "backbone": backbone,
-        "num_labels": ckpt_raw.get("num_labels", 2),
-        "image_size": ckpt_raw.get("image_size", image_size),
-        "epoch": epoch,
-        "id2label": ckpt_raw.get("id2label", {0: "background", 1: "rooftop"}),
-        "label2id": ckpt_raw.get("label2id", {"background": 0, "rooftop": 1}),
-        "confidence_threshold": ckpt_raw.get("confidence_threshold", 0.5),
-        "stored_val_metrics": ckpt_raw.get("metrics", {}),
-        "has_optimizer_state": "optimizer_state_dict" in ckpt_raw,
-        "has_scheduler_state": "scheduler_state_dict" in ckpt_raw,
-        "has_scaler_state": "scaler_state_dict" in ckpt_raw,
-        "has_random_state": "random_state" in ckpt_raw,
-        "total_tensors": len(ckpt_raw.get("model_state_dict", {})),
-    }
-
-    with open(output_dir / "checkpoint_info.json", "w", encoding="utf-8") as f:
-        json.dump(checkpoint_info, f, indent=2, default=str)
-
-    # 4. Load Model
-    ensure_models_registered()
-    model = load_model_from_checkpoint(resolved_checkpoint, device=device)
-    model.eval()
-
-    total_params = sum(p.numel() for p in model.parameters())
-
-    # 5. Discover test samples
+    # 2. Discover Test Set
     img_paths, mask_paths = MassachusettsDataset.discover_pairs(
         root_dir=dataset_root,
         images_dir="test",
         masks_dir="test_labels",
     )
+    logger.info("Discovered %d test image/mask pairs in %s", len(img_paths), dataset_root)
 
-    if not img_paths:
-        raise RuntimeError(f"No test image-mask pairs discovered in {dataset_root}")
+    # 3. Instantiate Inferencer
+    inferencer = SegmentationInferencer(
+        checkpoint_path=resolved_checkpoint,
+        image_size=image_size,
+        tile_stride=tile_stride,
+        tile_batch_size=8,
+        blend_mode="gaussian",
+        device=device,
+    )
 
-    # 6. Prepare Evaluators
-    aug = AugmentationPipeline(image_size=image_size)
-    val_transform = aug.get_val_transform()
-    mask_cleaner = MaskCleaner(min_region_area=50)
-    polygon_extractor = PolygonExtractor()
-    area_estimator = AreaEstimator(gsd=1.0)
-    use_amp = device.type == "cuda"
+    # 4. Initialize Metric Accumulators for Modes A, B, C, D
+    acc_mode_a = SegmentationMetrics(num_classes=2)  # Single-Pass 512
+    acc_mode_b = SegmentationMetrics(num_classes=2)  # Tiled Native
+    acc_mode_c = SegmentationMetrics(num_classes=2)  # Tiled + TTA
+    acc_mode_d = SegmentationMetrics(num_classes=2)  # Tiled + Cleaner
 
-    # Metric Accumulators
-    primary_acc = SegmentationMetrics(num_classes=2)
-    fullres_raw_acc = SegmentationMetrics(num_classes=2)
-    fullres_clean_acc = SegmentationMetrics(num_classes=2)
+    per_image_results = []
 
-    per_image_results: list[dict[str, Any]] = []
-    total_inference_time_ms = 0.0
+    # 5. Execute Evaluations
+    for idx, (img_p, msk_p) in enumerate(zip(img_paths, mask_paths)):
+        img_name = img_p.name
+        img_rgb = load_image_rgb(img_p)
+        gt_binary = load_mask_binary(msk_p)
 
-    print()
-    print("=" * 65)
-    print("  MP SURYA-DRISHTI — SEGFORMER-B2 EVALUATION & SHOWCASE")
-    print("=" * 65)
-    print(f"  Checkpoint : {resolved_checkpoint.name}")
-    print(f"  Path       : {resolved_checkpoint}")
-    print(f"  Epoch      : {epoch}")
-    print(f"  Model      : {model_type} ({backbone})")
-    print(f"  Parameters : {total_params:,}")
-    print(f"  Samples    : {len(img_paths)} test images")
-    print(f"  Device     : {device}")
-    print("-" * 65)
-    print("  RUNNING MULTI-MODE EVALUATION ON TEST SAMPLES...")
-    print("-" * 65)
+        # Mode A: Single-Pass Resize 512
+        res_a = inferencer.run(img_p, tiled=False)
+        gt_512 = cv2.resize(gt_binary, (image_size, image_size), interpolation=cv2.INTER_NEAREST)
+        pred_512 = cv2.resize(res_a.binary_mask, (image_size, image_size), interpolation=cv2.INTER_NEAREST)
+        acc_mode_a.update(pred_512, gt_512)
 
-    for idx, (img_path, msk_path) in enumerate(zip(img_paths, mask_paths), 1):
-        image_name = img_path.stem
+        # Mode B: Tiled Native Resolution (512x512, stride 256, Gaussian blend)
+        res_b = inferencer.run(img_p, tiled=True, tta=False, apply_cleaner=False)
+        acc_mode_b.update(res_b.binary_mask, gt_binary)
 
-        # Load original image and ground truth
-        original = load_image_rgb(img_path)
-        orig_h, orig_w = original.shape[:2]
-        gt_mask_1500 = load_mask_binary(msk_path)
+        # Mode C: Tiled + TTA (if enabled via --tta)
+        if eval_tta:
+            res_c = inferencer.run(img_p, tiled=True, tta=True, apply_cleaner=False)
+            acc_mode_c.update(res_c.binary_mask, gt_binary)
+        else:
+            acc_mode_c.update(res_b.binary_mask, gt_binary)
 
-        # Create 512x512 ground truth for Primary Evaluation
-        gt_mask_512 = cv2.resize(gt_mask_1500, (image_size, image_size), interpolation=cv2.INTER_NEAREST)
+        # Mode D: Tiled + Cleaner Diagnostic (applied directly on Mode B prediction)
+        mask_d = inferencer.mask_cleaner.clean(res_b.binary_mask)
+        acc_mode_d.update(mask_d, gt_binary)
 
-        # Preprocess Image using exact validation transform matching training
-        resized_img = cv2.resize(original, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-        augmented = val_transform(image=resized_img, mask=gt_mask_512)
-        img_tensor = torch.from_numpy(augmented["image"]).permute(2, 0, 1).float() / 255.0
-        img_tensor = img_tensor.unsqueeze(0).to(device)
+        # Compute per-image metrics
+        m_a = SegmentationMetrics(num_classes=2)
+        m_a.update(pred_512, gt_512)
+        r_a = m_a.compute()
 
-        # Model Inference
-        start_t = time.time()
-        with torch.no_grad():
-            with autocast(device_type="cuda", enabled=use_amp):
-                prediction = model.predict(img_tensor)
-        inference_ms = (time.time() - start_t) * 1000
-        total_inference_time_ms += inference_ms
+        m_b = SegmentationMetrics(num_classes=2)
+        m_b.update(res_b.binary_mask, gt_binary)
+        r_b = m_b.compute()
 
-        # Raw 512x512 Prediction
-        pred_mask_512 = prediction["binary_mask"].squeeze(0).cpu().numpy().astype(np.uint8)
-        conf_map_512 = prediction["confidence_map"].squeeze(0).cpu().numpy()
-
-        # Mode A: Primary Evaluation (512x512 native)
-        primary_single = SegmentationMetrics.compute_single(pred_mask_512, gt_mask_512)
-        primary_acc.update(
-            torch.from_numpy(pred_mask_512).unsqueeze(0),
-            torch.from_numpy(gt_mask_512).unsqueeze(0),
+        # Generate error map and debug visual figure
+        err_map = compute_error_difference_map(gt_binary, res_b.binary_mask)
+        fig_path = images_dir / f"debug_{img_name}"
+        save_5panel_debug_figure(
+            original=img_rgb,
+            ground_truth=gt_binary,
+            pred_single=res_a.binary_mask,
+            pred_tiled=res_b.binary_mask,
+            error_map=err_map,
+            single_iou=r_a["rooftop_iou"],
+            tiled_iou=r_b["rooftop_iou"],
+            save_path=fig_path,
+            image_name=img_name,
         )
 
-        # Mode B: Full-Resolution Raw Reconstruction (1500x1500 raw nearest neighbor upsampling)
-        pred_mask_1500_raw = cv2.resize(pred_mask_512, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-        fullres_raw_single = SegmentationMetrics.compute_single(pred_mask_1500_raw, gt_mask_1500)
-        fullres_raw_acc.update(
-            torch.from_numpy(pred_mask_1500_raw).unsqueeze(0),
-            torch.from_numpy(gt_mask_1500).unsqueeze(0),
-        )
-
-        # Mode C: Full-Resolution Postprocessed Diagnostic (MaskCleaner)
-        pred_mask_512_cleaned = mask_cleaner.clean(pred_mask_512)
-        pred_mask_1500_cleaned = cv2.resize(pred_mask_512_cleaned, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
-        fullres_clean_single = SegmentationMetrics.compute_single(pred_mask_1500_cleaned, gt_mask_1500)
-        fullres_clean_acc.update(
-            torch.from_numpy(pred_mask_1500_cleaned).unsqueeze(0),
-            torch.from_numpy(gt_mask_1500).unsqueeze(0),
-        )
-
-        # Confidence & Geometry Extraction (on Raw Prediction)
-        roof_pixels = pred_mask_512 > 0
-        mean_conf = float(conf_map_512[roof_pixels].mean()) if roof_pixels.any() else 0.0
-        area_info = area_estimator.estimate(pred_mask_1500_raw)
-        polygons = polygon_extractor.extract(pred_mask_1500_raw)
-        raw_overlay = create_colored_overlay(original, pred_mask_1500_raw)
-
-        # Save Visual Artifacts
-        prefix = f"{idx:03d}_{image_name}"
-
-        # 4-Panel Primary Comparison Figure
-        save_comparison_figure(
-            original=original,
-            ground_truth=gt_mask_1500,
-            prediction_raw=pred_mask_1500_raw,
-            overlay=raw_overlay,
-            primary_metrics=primary_single,
-            fullres_metrics=fullres_raw_single,
-            save_path=images_dir / f"{prefix}_comparison.png",
-            image_name=image_name,
-        )
-
-        # Diagnostic Comparison (Raw vs Cleaner)
-        save_diagnostic_comparison_figure(
-            original=original,
-            ground_truth=gt_mask_1500,
-            prediction_raw=pred_mask_1500_raw,
-            prediction_cleaned=pred_mask_1500_cleaned,
-            raw_iou=fullres_raw_single["iou"],
-            cleaned_iou=fullres_clean_single["iou"],
-            save_path=images_dir / f"{prefix}_diagnostic_cleaner.png",
-            image_name=image_name,
-        )
-
-        # Raw Mask & Overlay Images
-        cv2.imwrite(str(images_dir / f"{prefix}_raw_mask.png"), pred_mask_1500_raw * 255)
-        cv2.imwrite(str(images_dir / f"{prefix}_cleaned_mask_diagnostic.png"), pred_mask_1500_cleaned * 255)
-        cv2.imwrite(str(images_dir / f"{prefix}_overlay.png"), cv2.cvtColor(raw_overlay, cv2.COLOR_RGB2BGR))
-
-        entry = {
-            "index": idx,
-            "image_name": image_name,
-            "primary_metrics": {
-                "rooftop_iou": round(primary_single["iou"], 4),
-                "rooftop_dice": round(primary_single["dice"], 4),
-                "pixel_accuracy": round(primary_single["pixel_accuracy"], 4),
+        per_image_results.append({
+            "index": idx + 1,
+            "image_name": img_name,
+            "single_metrics": {
+                "pixel_accuracy": round(r_a["pixel_accuracy"], 4),
+                "mean_iou": round(r_a["iou"], 4),
+                "rooftop_iou": round(r_a["rooftop_iou"], 4),
+                "rooftop_dice": round(r_a["rooftop_dice"], 4),
             },
-            "full_resolution_raw_metrics": {
-                "rooftop_iou": round(fullres_raw_single["iou"], 4),
-                "rooftop_dice": round(fullres_raw_single["dice"], 4),
-                "pixel_accuracy": round(fullres_raw_single["pixel_accuracy"], 4),
+            "tiled_metrics": {
+                "pixel_accuracy": round(r_b["pixel_accuracy"], 4),
+                "mean_iou": round(r_b["iou"], 4),
+                "rooftop_iou": round(r_b["rooftop_iou"], 4),
+                "rooftop_dice": round(r_b["rooftop_dice"], 4),
             },
-            "full_resolution_cleaned_metrics": {
-                "rooftop_iou": round(fullres_clean_single["iou"], 4),
-                "rooftop_dice": round(fullres_clean_single["dice"], 4),
-                "pixel_accuracy": round(fullres_clean_single["pixel_accuracy"], 4),
-            },
-            "confidence": round(mean_conf, 4),
-            "roof_area_pixels": area_info["roof_area_pixels"],
-            "roof_area_percent": round(area_info["roof_area_percent"], 2),
-            "polygons_count": len(polygons),
-            "inference_time_ms": round(inference_ms, 1),
-        }
-        per_image_results.append(entry)
+        })
 
-        print(
-            f"  [{idx:02d}/{len(img_paths)}] {image_name:18s} | "
-            f"Primary IoU: {primary_single['iou']*100:5.2f}% | "
-            f"Full-Res Raw: {fullres_raw_single['iou']*100:5.2f}% | "
-            f"Cleaner: {fullres_clean_single['iou']*100:5.2f}% | "
-            f"Time: {inference_ms:4.0f}ms"
-        )
+    # 6. Compute Aggregate Metrics
+    mode_a_res = acc_mode_a.compute()
+    mode_b_res = acc_mode_b.compute()
+    mode_c_res = acc_mode_c.compute()
+    mode_d_res = acc_mode_d.compute()
 
-    # 7. Compute Global Aggregate Metrics
-    res_primary = primary_acc.compute()
-    res_fullres_raw = fullres_raw_acc.compute()
-    res_fullres_clean = fullres_clean_acc.compute()
-
-    primary_payload = {
-        "pixel_accuracy": round(res_primary["pixel_accuracy"], 4),
-        "mean_iou": round(res_primary["iou"], 4),
-        "rooftop_iou": round(res_primary["rooftop_iou"], 4),
-        "rooftop_dice": round(res_primary["rooftop_dice"], 4),
-        "background_iou": round(res_primary["iou_per_class"][0], 4) if len(res_primary["iou_per_class"]) > 0 else 0.0,
+    payload_a = {
+        "pixel_accuracy": round(mode_a_res["pixel_accuracy"], 4),
+        "mean_iou": round(mode_a_res["iou"], 4),
+        "rooftop_iou": round(mode_a_res["rooftop_iou"], 4),
+        "rooftop_dice": round(mode_a_res["rooftop_dice"], 4),
+        "background_iou": round(mode_a_res["iou_per_class"][0], 4) if len(mode_a_res["iou_per_class"]) > 0 else 0.0,
+    }
+    payload_b = {
+        "pixel_accuracy": round(mode_b_res["pixel_accuracy"], 4),
+        "mean_iou": round(mode_b_res["iou"], 4),
+        "rooftop_iou": round(mode_b_res["rooftop_iou"], 4),
+        "rooftop_dice": round(mode_b_res["rooftop_dice"], 4),
+        "background_iou": round(mode_b_res["iou_per_class"][0], 4) if len(mode_b_res["iou_per_class"]) > 0 else 0.0,
+    }
+    payload_c = {
+        "pixel_accuracy": round(mode_c_res["pixel_accuracy"], 4),
+        "mean_iou": round(mode_c_res["iou"], 4),
+        "rooftop_iou": round(mode_c_res["rooftop_iou"], 4),
+        "rooftop_dice": round(mode_c_res["rooftop_dice"], 4),
+        "background_iou": round(mode_c_res["iou_per_class"][0], 4) if len(mode_c_res["iou_per_class"]) > 0 else 0.0,
+    }
+    payload_d = {
+        "pixel_accuracy": round(mode_d_res["pixel_accuracy"], 4),
+        "mean_iou": round(mode_d_res["iou"], 4),
+        "rooftop_iou": round(mode_d_res["rooftop_iou"], 4),
+        "rooftop_dice": round(mode_d_res["rooftop_dice"], 4),
+        "background_iou": round(mode_d_res["iou_per_class"][0], 4) if len(mode_d_res["iou_per_class"]) > 0 else 0.0,
     }
 
-    fullres_raw_payload = {
-        "pixel_accuracy": round(res_fullres_raw["pixel_accuracy"], 4),
-        "mean_iou": round(res_fullres_raw["iou"], 4),
-        "rooftop_iou": round(res_fullres_raw["rooftop_iou"], 4),
-        "rooftop_dice": round(res_fullres_raw["rooftop_dice"], 4),
-        "background_iou": round(res_fullres_raw["iou_per_class"][0], 4) if len(res_fullres_raw["iou_per_class"]) > 0 else 0.0,
-    }
+    # 7. Generate Tile Grid Visualization on First Image
+    first_img = load_image_rgb(img_paths[0])
+    tile_coords = generate_tile_coordinates(
+        image_width=first_img.shape[1],
+        image_height=first_img.shape[0],
+        tile_size=image_size,
+        stride=tile_stride,
+    )
+    save_tile_grid_visualization(first_img, tile_coords, charts_dir / "tile_grid_visualization.png")
 
-    fullres_clean_payload = {
-        "pixel_accuracy": round(res_fullres_clean["pixel_accuracy"], 4),
-        "mean_iou": round(res_fullres_clean["iou"], 4),
-        "rooftop_iou": round(res_fullres_clean["rooftop_iou"], 4),
-        "rooftop_dice": round(res_fullres_clean["rooftop_dice"], 4),
-        "background_iou": round(res_fullres_clean["iou_per_class"][0], 4) if len(res_fullres_clean["iou_per_class"]) > 0 else 0.0,
-    }
+    # 8. Generate Benchmark Charts
+    save_metrics_bar_chart(payload_a, charts_dir / "metrics_bar_chart.png")
+    save_pipeline_comparison_chart(payload_a, payload_b, payload_c, payload_d, charts_dir / "pipeline_comparison_chart.png")
+    save_per_image_iou_chart(per_image_results, charts_dir / "per_image_iou_chart.png")
+    save_confusion_matrix_chart(acc_mode_a.confusion_matrix, charts_dir / "confusion_matrix.png", title_suffix="Mode A: 512×512")
 
-    # 8. Save JSON Outputs
-    with open(output_dir / "per_image_metrics.json", "w", encoding="utf-8") as f:
-        json.dump(per_image_results, f, indent=2)
-
-    eval_results_json = {
+    # 9. Save JSON Artifacts
+    full_report = {
+        "report_generated_at": datetime.now().isoformat(),
         "checkpoint": str(resolved_checkpoint),
-        "epoch": epoch,
         "dataset": "Massachusetts Buildings Dataset",
         "split": "test",
         "num_samples": len(img_paths),
-        "model_type": model_type,
-        "backbone": backbone,
-        "image_size": image_size,
-        "primary_evaluation": primary_payload,
-        "full_resolution_raw": fullres_raw_payload,
-        "full_resolution_cleaned": fullres_clean_payload,
-        "total_inference_time_ms": round(total_inference_time_ms, 1),
-        "avg_inference_time_ms": round(total_inference_time_ms / len(img_paths), 1),
+        "evaluation_modes": {
+            "mode_a_single_pass_512": payload_a,
+            "mode_b_tiled_native_resolution": payload_b,
+            "mode_c_tiled_tta": payload_c,
+            "mode_d_tiled_cleaner": payload_d,
+        },
+        "per_image_results": per_image_results,
     }
 
     with open(output_dir / "test_evaluation_results.json", "w", encoding="utf-8") as f:
-        json.dump(eval_results_json, f, indent=2)
+        json.dump(full_report, f, indent=2)
 
-    # 9. Generate Charts
-    logger.info("Generating charts...")
-    save_metrics_bar_chart(primary_payload, charts_dir / "metrics_bar_chart.png", model_name="SegFormer-B2")
-    save_pipeline_comparison_chart(primary_payload, fullres_raw_payload, fullres_clean_payload, charts_dir / "pipeline_comparison_chart.png")
-    save_per_image_iou_chart(per_image_results, charts_dir / "per_image_iou_chart.png")
-    save_confusion_matrix_chart(primary_acc.confusion_matrix, charts_dir / "confusion_matrix.png", title_suffix="Primary (512×512)")
+    with open(output_dir / "per_image_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(per_image_results, f, indent=2)
 
-    # 10. Generate Summary Report Text File
+    # 10. Write Text Summary Report
     report_lines = [
-        "=" * 65,
-        "  MP SURYA-DRISHTI — SEGFORMER-B2 EVALUATION REPORT",
-        "  Best Verified Baseline Performance & Diagnostics",
-        "=" * 65,
-        "",
+        "=" * 68,
+        "  MP SURYA-DRISHTI — TEST EVALUATION & BENCHMARK REPORT",
+        "=" * 68,
         f"  Report Date : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"  Checkpoint  : {resolved_checkpoint.name}",
-        f"  Epoch       : {epoch}",
-        f"  Model       : {model_type} ({backbone})",
-        f"  Parameters  : {total_params:,}",
-        f"  Dataset     : Massachusetts Buildings Dataset",
-        f"  Split       : test",
-        f"  Samples     : {len(img_paths)} satellite images",
-        f"  Resolution  : {image_size}×{image_size}",
+        f"  Test Images : {len(img_paths)} satellite scenes (1500×1500 px)",
         "",
-        "=" * 65,
-        "  PERFORMANCE CARD (PRIMARY BASELINE)",
-        "=" * 65,
-        f"  MODEL             : SegFormer-B2 ({backbone})",
-        f"  CHECKPOINT        : {resolved_checkpoint.name}",
-        f"  EPOCH             : {epoch}",
-        f"  TEST IMAGES       : {len(img_paths)}",
-        f"  PIXEL ACCURACY    : {primary_payload['pixel_accuracy'] * 100:.2f}%",
-        f"  MEAN IoU          : {primary_payload['mean_iou'] * 100:.2f}%",
-        f"  ROOFTOP IoU       : {primary_payload['rooftop_iou'] * 100:.2f}%",
-        f"  ROOFTOP DICE      : {primary_payload['rooftop_dice'] * 100:.2f}%",
-        f"  BACKGROUND IoU    : {primary_payload['background_iou'] * 100:.2f}%",
+        "=" * 68,
+        "  EVALUATION MATRIX COMPARISON",
+        "=" * 68,
+        f"  {'Evaluation Mode':<30s} | {'Pixel Acc':>9s} | {'Mean IoU':>8s} | {'Roof IoU':>8s} | {'Roof Dice':>9s} |",
+        "  " + "-" * 66,
+        f"  {'Mode A: 512×512 Baseline':<30s} | {payload_a['pixel_accuracy']*100:8.2f}% | {payload_a['mean_iou']*100:7.2f}% | {payload_a['rooftop_iou']*100:7.2f}% | {payload_a['rooftop_dice']*100:8.2f}% |",
+        f"  {'Mode B: Tiled Native (s256)':<30s} | {payload_b['pixel_accuracy']*100:8.2f}% | {payload_b['mean_iou']*100:7.2f}% | {payload_b['rooftop_iou']*100:7.2f}% | {payload_b['rooftop_dice']*100:8.2f}% |",
+        f"  {'Mode C: Tiled + TTA':<30s} | {payload_c['pixel_accuracy']*100:8.2f}% | {payload_c['mean_iou']*100:7.2f}% | {payload_c['rooftop_iou']*100:7.2f}% | {payload_c['rooftop_dice']*100:8.2f}% |",
+        f"  {'Mode D: Tiled + Cleaner':<30s} | {payload_d['pixel_accuracy']*100:8.2f}% | {payload_d['mean_iou']*100:7.2f}% | {payload_d['rooftop_iou']*100:7.2f}% | {payload_d['rooftop_dice']*100:8.2f}% |",
+        "  " + "-" * 66,
         "",
-        "=" * 65,
-        "  PIPELINE COMPARISON TABLE",
-        "=" * 65,
-        f"  {'Evaluation Mode':<25s} | {'Pixel Acc':>9s} | {'Mean IoU':>8s} | {'Roof IoU':>8s} | {'Roof Dice':>9s} |",
-        "  " + "-" * 63,
-        f"  {'512×512 Primary':<25s} | {primary_payload['pixel_accuracy']*100:8.2f}% | {primary_payload['mean_iou']*100:7.2f}% | {primary_payload['rooftop_iou']*100:7.2f}% | {primary_payload['rooftop_dice']*100:8.2f}% |",
-        f"  {'1500×1500 Raw':<25s} | {fullres_raw_payload['pixel_accuracy']*100:8.2f}% | {fullres_raw_payload['mean_iou']*100:7.2f}% | {fullres_raw_payload['rooftop_iou']*100:7.2f}% | {fullres_raw_payload['rooftop_dice']*100:8.2f}% |",
-        f"  {'1500×1500 + Cleaner':<25s} | {fullres_clean_payload['pixel_accuracy']*100:8.2f}% | {fullres_clean_payload['mean_iou']*100:7.2f}% | {fullres_clean_payload['rooftop_iou']*100:7.2f}% | {fullres_clean_payload['rooftop_dice']*100:8.2f}% |",
-        "  " + "-" * 63,
-        "",
-        "  NOTE ON POSTPROCESSING:",
-        "  MaskCleaner currently filters small rooftop clusters as noise,",
-        "  which reduces measured rooftop IoU on this test set. Therefore,",
-        "  the raw model output is presented as the primary baseline.",
-        "",
-        "=" * 65,
-        "  PER-IMAGE BREAKDOWN",
-        "=" * 65,
-        f"  {'#':>3s} | {'Image Name':<18s} | {'Primary IoU':>11s} | {'Raw 1500 IoU':>12s} | {'Cleaned IoU':>11s} |",
-        "  " + "-" * 63,
-    ]
-
-    for r in per_image_results:
-        report_lines.append(
-            f"  {r['index']:3d} | {r['image_name']:<18s} | {r['primary_metrics']['rooftop_iou']*100:10.2f}% | {r['full_resolution_raw_metrics']['rooftop_iou']*100:11.2f}% | {r['full_resolution_cleaned_metrics']['rooftop_iou']*100:10.2f}% |"
-        )
-
-    report_lines.extend([
-        "  " + "-" * 63,
-        "",
-        "=" * 65,
+        "=" * 68,
         "  GENERATED OUTPUT ARTIFACTS",
-        "=" * 65,
+        "=" * 68,
         f"  Output Directory : {output_dir}",
         f"  Results JSON     : test_evaluation_results.json",
         f"  Per-Image JSON   : per_image_metrics.json",
-        f"  Checkpoint Info  : checkpoint_info.json",
-        f"  Summary Report   : summary_report.txt",
         f"  Charts Folder    : charts/",
-        f"  Images Folder    : images/ ({len(img_paths)*3} files)",
-        "=" * 65,
-    ])
+        f"  Debug Figures    : images/ (5-panel comparisons)",
+        "=" * 68,
+    ]
 
-    report_text = "\n".join(report_lines)
     with open(output_dir / "summary_report.txt", "w", encoding="utf-8") as f:
-        f.write(report_text)
+        f.write("\n".join(report_lines))
 
-    # 11. Terminal Output
-    print()
-    print("=" * 65)
-    print("MP SURYA-DRISHTI — SEGFORMER-B2 EVALUATION")
-    print("=" * 65)
-    print(f"Checkpoint : {resolved_checkpoint.name}")
-    print(f"Epoch      : {epoch}")
-    print(f"Dataset    : Massachusetts Buildings")
-    print(f"Split      : test")
-    print(f"Samples    : {len(img_paths)}")
-    print(f"Resolution : {image_size}×{image_size}")
-    print()
-    print("PRIMARY MODEL PERFORMANCE")
-    print("-" * 65)
-    print(f"Pixel Accuracy : {primary_payload['pixel_accuracy'] * 100:.2f}%")
-    print(f"Mean IoU       : {primary_payload['mean_iou'] * 100:.2f}%")
-    print(f"Rooftop IoU    : {primary_payload['rooftop_iou'] * 100:.2f}%")
-    print(f"Rooftop Dice   : {primary_payload['rooftop_dice'] * 100:.2f}%")
-    print()
-    print("FULL-RESOLUTION DIAGNOSTICS")
-    print("-" * 65)
-    print(f"Raw 1500x1500 Rooftop IoU     : {fullres_raw_payload['rooftop_iou'] * 100:.2f}%")
-    print(f"MaskCleaner Rooftop IoU       : {fullres_clean_payload['rooftop_iou'] * 100:.2f}%")
-    print()
-    print("NOTE:")
-    print("MaskCleaner currently reduces measured rooftop IoU on this")
-    print("test set and is therefore NOT used for the primary result.")
-    print("=" * 65)
-    print()
-    print(f"[OK] Outputs saved to: {output_dir}")
-    print()
-
-    return eval_results_json
+    print("\n" + "\n".join(report_lines) + "\n")
+    return full_report
 
 
 def main() -> None:
     """CLI Entry Point."""
-    parser = argparse.ArgumentParser(
-        description="Evaluate segmentation models and generate showcase artifacts.",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        default=None,
-        help="Path to checkpoint (auto-selects best available via validation metrics if omitted)",
-    )
-    parser.add_argument(
-        "--dataset-root",
-        default="datasets/massachusetts",
-        help="Path to dataset root directory",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="outputs",
-        help="Base outputs directory",
-    )
-    parser.add_argument(
-        "--image-size",
-        type=int,
-        default=512,
-        help="Model input image size (default 512)",
-    )
+    parser = argparse.ArgumentParser(description="Run evaluation showcase.")
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--dataset-root", default="datasets/massachusetts")
+    parser.add_argument("--output-dir", default="outputs")
+    parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--stride", type=int, default=256)
+    parser.add_argument("--tta", action="store_true", default=False, help="Enable Test-Time Augmentation")
 
     args = parser.parse_args()
 
@@ -853,6 +612,8 @@ def main() -> None:
         dataset_root=args.dataset_root,
         output_base_dir=args.output_dir,
         image_size=args.image_size,
+        tile_stride=args.stride,
+        eval_tta=args.tta,
     )
 
 

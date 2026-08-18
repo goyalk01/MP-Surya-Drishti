@@ -98,11 +98,11 @@ class MaskCleaner:
         # Step 3: Remove small connected components
         cleaned = self._filter_small_regions(cleaned)
 
-        pixels_removed = int(mask.sum() - cleaned.sum())
+        pixels_removed = int(np.int64(mask.sum()) - np.int64(cleaned.sum()))
         logger.debug(
             "Mask cleaned: %d pixels removed (%.1f%%)",
             pixels_removed,
-            100 * pixels_removed / max(mask.sum(), 1),
+            100 * pixels_removed / max(int(mask.sum()), 1),
         )
 
         return cleaned

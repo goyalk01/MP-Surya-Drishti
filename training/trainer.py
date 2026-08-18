@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from evaluation.metrics import SegmentationMetrics
-from training.losses import CombinedSegmentationLoss
+from training.losses import get_loss_function
 from training.scheduler import get_scheduler
 from utils.device_utils import get_device
 
@@ -80,6 +80,15 @@ class SegmentationTrainer:
         self.log_interval = train_cfg.get("log_interval", 10)
         self.val_interval = train_cfg.get("val_interval", 1)
 
+        # Strategy & Tiling metadata
+        self.training_strategy = train_cfg.get("strategy", "tiled")
+        tiling_cfg = train_cfg.get("tiling", {})
+        self.tile_size = tiling_cfg.get("tile_size", getattr(model, "image_size", 512))
+        self.tile_stride = tiling_cfg.get("stride", 256)
+        loss_cfg = train_cfg.get("loss", {})
+        self.loss_type = loss_cfg.get("name", loss_cfg.get("type", "focal_dice"))
+        self.tta_enabled = False
+
         # Optimizer
         opt_cfg = train_cfg.get("optimizer", {})
         self.optimizer = torch.optim.AdamW(
@@ -91,12 +100,7 @@ class SegmentationTrainer:
         )
 
         # Loss function
-        loss_cfg = train_cfg.get("loss", {})
-        self.criterion = CombinedSegmentationLoss(
-            bce_weight=loss_cfg.get("bce_weight", 0.5),
-            dice_weight=loss_cfg.get("dice_weight", 0.5),
-            pos_weight=loss_cfg.get("pos_weight", 2.0),
-        )
+        self.criterion = get_loss_function(train_cfg)
 
         # LR Scheduler
         sched_cfg = train_cfg.get("scheduler", {})
@@ -348,7 +352,15 @@ class SegmentationTrainer:
                 optimizer_state=self.optimizer.state_dict(),
                 scheduler_state=self.scheduler.state_dict() if hasattr(self.scheduler, "state_dict") else None,
                 metrics=metrics,
-                extra={"best_iou": self.best_iou, "best_loss": self.best_loss},
+                extra={
+                    "best_iou": self.best_iou,
+                    "best_loss": self.best_loss,
+                    "training_strategy": self.training_strategy,
+                    "tile_size": self.tile_size,
+                    "tile_stride": self.tile_stride,
+                    "loss_type": self.loss_type,
+                    "tta_enabled": self.tta_enabled,
+                },
             )
         else:
             torch.save(
@@ -357,6 +369,11 @@ class SegmentationTrainer:
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "metrics": metrics,
+                    "training_strategy": self.training_strategy,
+                    "tile_size": self.tile_size,
+                    "tile_stride": self.tile_stride,
+                    "loss_type": self.loss_type,
+                    "tta_enabled": self.tta_enabled,
                 },
                 path,
             )

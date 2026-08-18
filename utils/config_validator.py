@@ -1,8 +1,9 @@
 """
 Configuration validator for MP Surya-Drishti.
 
-Validates YAML configuration files for model, dataset, and training parameters.
-Raises descriptive errors with clear troubleshooting instructions.
+Validates YAML configuration files for model, dataset, training, tiling,
+and postprocessing parameters. Raises descriptive errors with clear
+troubleshooting instructions.
 """
 
 from __future__ import annotations
@@ -61,6 +62,30 @@ def validate_model_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"Invalid model_config: 'confidence_threshold' must be between 0.0 and 1.0, got {confidence_threshold}."
         )
+
+    # Optional Tiling Block
+    tiling_cfg = model_cfg.get("tiling")
+    if tiling_cfg is not None and isinstance(tiling_cfg, dict):
+        strategy = tiling_cfg.get("strategy", "tiled")
+        if strategy not in ["tiled", "full_image"]:
+            raise ValueError(
+                f"Invalid model_config.tiling.strategy: must be 'tiled' or 'full_image', got '{strategy}'."
+            )
+        tile_size = tiling_cfg.get("tile_size", 512)
+        if not isinstance(tile_size, int) or tile_size <= 0:
+            raise ValueError(f"Invalid model_config.tiling.tile_size: must be > 0, got {tile_size}.")
+        stride = tiling_cfg.get("stride", 256)
+        if not isinstance(stride, int) or stride <= 0:
+            raise ValueError(f"Invalid model_config.tiling.stride: must be > 0, got {stride}.")
+
+    # Optional Tiled Inference Block
+    inf_cfg = model_cfg.get("tiled_inference")
+    if inf_cfg is not None and isinstance(inf_cfg, dict):
+        blend_mode = inf_cfg.get("blend_mode", "gaussian").lower()
+        if blend_mode not in ["gaussian", "uniform"]:
+            raise ValueError(
+                f"Invalid model_config.tiled_inference.blend_mode: must be 'gaussian' or 'uniform', got '{blend_mode}'."
+            )
 
     logger.debug("Model configuration validation passed.")
     return model_cfg
@@ -122,6 +147,22 @@ def validate_training_config(config: dict[str, Any]) -> dict[str, Any]:
     lr = opt_cfg.get("learning_rate", 6e-5)
     if not isinstance(lr, (int, float)) or lr <= 0:
         raise ValueError(f"Invalid training_config: 'learning_rate' must be > 0, got {lr}.")
+
+    # Loss validation
+    loss_cfg = training_cfg.get("loss", {})
+    loss_type = loss_cfg.get("name", loss_cfg.get("type", "ce_dice")).lower()
+    allowed_losses = ["focal_dice", "focal", "ce_dice", "bce_dice"]
+    if loss_type not in allowed_losses:
+        raise ValueError(
+            f"Invalid training_config.loss: type '{loss_type}' not recognized. Must be one of {allowed_losses}."
+        )
+
+    # Strategy validation
+    strategy = training_cfg.get("strategy", "tiled")
+    if strategy not in ["tiled", "full_image"]:
+        raise ValueError(
+            f"Invalid training_config.strategy: must be 'tiled' or 'full_image', got '{strategy}'."
+        )
 
     logger.debug("Training configuration validation passed.")
     return training_cfg

@@ -2,6 +2,9 @@
 # ================================================================
 
 training:
+  # Training strategy: "tiled" (native resolution crops) or "full_image"
+  strategy: "tiled"
+
   # Number of training epochs
   epochs: 50
 
@@ -33,13 +36,22 @@ training:
     patience: 5
     factor: 0.5
 
-  # Loss function configuration
+  # Loss function configuration: "focal_dice" | "ce_dice" | "bce_dice"
   loss:
-    name: "bce_dice"
-    bce_weight: 0.5
+    name: "focal_dice"
+    focal_weight: 0.5
     dice_weight: 0.5
-    # pos_weight for BCEWithLogitsLoss — increase if rooftops are rare
+    focal_gamma: 2.0
+    focal_alpha: 0.25
+    dice_smooth: 1.0
+    # CE / BCE parameters for fallback
+    ce_weight: 0.5
     pos_weight: 2.0
+
+  # Native-Resolution Tiling settings
+  tiling:
+    tile_size: 512
+    stride: 256
 
   # Mixed precision training (recommended for CUDA)
   mixed_precision: true

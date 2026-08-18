@@ -224,6 +224,9 @@ class BaseSegmentationModel(ABC, nn.Module):
             checkpoint["config"] = config
         if extra is not None:
             checkpoint["extra"] = extra
+            for k, v in extra.items():
+                if k not in checkpoint:
+                    checkpoint[k] = v
 
         torch.save(checkpoint, path)
         logger.info(

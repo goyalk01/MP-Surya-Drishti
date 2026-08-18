@@ -65,6 +65,7 @@ outputs/experiments/*
 outputs/predictions/*
 outputs/visualizations/*
 outputs/reports/*
+outputs/images/*
 outputs/test_evaluation_outputs_*
 outputs/split_manifest.json
 !outputs/**/.gitkeep

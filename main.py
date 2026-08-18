@@ -5,10 +5,11 @@ Model-agnostic entry point that uses the model registry to create
 and load any registered segmentation model.
 
 Commands:
-    verify-dataset  Verify official dataset splits and pairing integrity
-    train           Train model on official partitions with TensorBoard & experiment tracking
-    infer           Run inference on a single image and generate prediction_report.json
-    evaluate        Evaluate model performance on the official test set using trained weights
+    verify-dataset     Verify official dataset splits and pairing integrity
+    measure-imbalance  Measure exact ground-truth class distribution on training split
+    train              Train model with native-resolution tiling or whole-image strategy
+    infer              Run inference with optional sliding-window tiling, Gaussian blend, and TTA
+    evaluate           Evaluate model performance across single-pass and tiled modes
 """
 
 from __future__ import annotations
@@ -38,11 +39,12 @@ def load_config(config_path: str) -> dict:
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    """Execute training pipeline using official dataset splits."""
+    """Execute training pipeline using official dataset splits and configurable strategy."""
     from models.registry import create_model, ensure_models_registered
     from preprocessing.augmentation import AugmentationPipeline
     from preprocessing.dataset_loader import MassachusettsDataset
     from preprocessing.splitter import DatasetSplitter
+    from preprocessing.tiled_dataset import TiledMassachusettsDataset
     from training.trainer import SegmentationTrainer
     from utils.device_utils import print_device_info
     from utils.experiment_manager import ExperimentManager
@@ -56,10 +58,29 @@ def cmd_train(args: argparse.Namespace) -> None:
     dataset_cfg = validate_dataset_config(dataset_config)
     training_cfg = validate_training_config(training_config)
 
+    # CLI Overrides
+    if args.loss is not None:
+        training_config["training"]["loss"]["name"] = args.loss
+        training_cfg["loss"]["name"] = args.loss
+    if args.epochs is not None:
+        training_config["training"]["epochs"] = args.epochs
+        training_cfg["epochs"] = args.epochs
+    if args.batch_size is not None:
+        training_config["training"]["batch_size"] = args.batch_size
+        training_cfg["batch_size"] = args.batch_size
+
+    use_tiling = args.tiled if args.tiled is not None else (training_cfg.get("strategy") == "tiled")
+    tile_size = args.tile_size or training_cfg.get("tiling", {}).get("tile_size", model_cfg.get("image_size", 512))
+    tile_stride = args.stride or training_cfg.get("tiling", {}).get("stride", 256)
+
+    training_config["training"]["strategy"] = "tiled" if use_tiling else "full_image"
+    training_config["training"]["tiling"] = {"tile_size": tile_size, "stride": tile_stride}
+
     # Initialize experiment manager
+    exp_name = args.exp_name or ("exp_003" if use_tiling else None)
     exp_manager = ExperimentManager(
         base_dir=args.experiment_dir,
-        exp_name=args.exp_name,
+        exp_name=exp_name,
     )
 
     logger = setup_logger(
@@ -69,7 +90,13 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     logger.info("=" * 60)
     logger.info("MP Surya-Drishti — Segmentation Framework Training")
-    logger.info("Experiment: %s | Output Path: %s", exp_manager.exp_name, exp_manager.exp_dir)
+    logger.info(
+        "Experiment: %s | Strategy: %s | Loss: %s | Output: %s",
+        exp_manager.exp_name,
+        "Native-Resolution Tiling" if use_tiling else "Whole-Image Resize",
+        training_config["training"]["loss"]["name"],
+        exp_manager.exp_dir,
+    )
     logger.info("=" * 60)
 
     print_device_info()
@@ -96,25 +123,44 @@ def cmd_train(args: argparse.Namespace) -> None:
         extensions=dataset_cfg.get("image_extensions"),
     )
 
-    augmentation = AugmentationPipeline(image_size=model_cfg["image_size"])
+    augmentation = AugmentationPipeline(image_size=tile_size)
     train_transform = augmentation.get_train_transform()
     val_transform = augmentation.get_val_transform()
 
-    train_dataset = MassachusettsDataset(
-        image_paths=train_img_paths,
-        mask_paths=train_mask_paths,
-        image_size=model_cfg["image_size"],
-        transform=train_transform,
-        mask_building_value=dataset_cfg.get("mask_building_value", 255),
-    )
-
-    val_dataset = MassachusettsDataset(
-        image_paths=val_img_paths,
-        mask_paths=val_mask_paths,
-        image_size=model_cfg["image_size"],
-        transform=val_transform,
-        mask_building_value=dataset_cfg.get("mask_building_value", 255),
-    )
+    if use_tiling:
+        logger.info("Building Native-Resolution Tiled Datasets (tile_size=%d, stride=%d)", tile_size, tile_stride)
+        train_dataset = TiledMassachusettsDataset(
+            image_paths=train_img_paths,
+            mask_paths=train_mask_paths,
+            tile_size=tile_size,
+            stride=tile_stride,
+            transform=train_transform,
+            mask_building_value=dataset_cfg.get("mask_building_value", 255),
+        )
+        val_dataset = TiledMassachusettsDataset(
+            image_paths=val_img_paths,
+            mask_paths=val_mask_paths,
+            tile_size=tile_size,
+            stride=tile_stride,
+            transform=val_transform,
+            mask_building_value=dataset_cfg.get("mask_building_value", 255),
+        )
+    else:
+        logger.info("Building Standard Resized Massachusetts Datasets (image_size=%d)", tile_size)
+        train_dataset = MassachusettsDataset(
+            image_paths=train_img_paths,
+            mask_paths=train_mask_paths,
+            image_size=tile_size,
+            transform=train_transform,
+            mask_building_value=dataset_cfg.get("mask_building_value", 255),
+        )
+        val_dataset = MassachusettsDataset(
+            image_paths=val_img_paths,
+            mask_paths=val_mask_paths,
+            image_size=tile_size,
+            transform=val_transform,
+            mask_building_value=dataset_cfg.get("mask_building_value", 255),
+        )
 
     loaders = DatasetSplitter.create_dataloaders(
         train_dataset=train_dataset,
@@ -161,7 +207,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 
 
 def cmd_infer(args: argparse.Namespace) -> None:
-    """Run inference on a single image and generate prediction_report.json."""
+    """Run inference on a single image with optional sliding-window tiling and TTA."""
     from evaluation.visualizer import SegmentationVisualizer
     from inference.inferencer import SegmentationInferencer
     from utils.io_utils import save_image, save_json
@@ -178,7 +224,7 @@ def cmd_infer(args: argparse.Namespace) -> None:
 
     model_config = load_config(args.model_config)
     model_cfg = validate_model_config(model_config)
-    image_size = model_cfg.get("image_size", 512)
+    image_size = args.tile_size or model_cfg.get("image_size", 512)
 
     # Determine checkpoint path
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else find_best_available_checkpoint()
@@ -189,51 +235,43 @@ def cmd_infer(args: argparse.Namespace) -> None:
     inferencer = SegmentationInferencer(
         checkpoint_path=checkpoint_path,
         image_size=image_size,
+        tile_stride=args.stride or 256,
+        tile_batch_size=args.batch_size or 8,
+        blend_mode=args.blend_mode or "gaussian",
         gsd=gsd,
+        apply_cleaner=args.cleaner,
     )
 
-    result = inferencer.run(args.image)
+    use_tiled = not args.no_tiled
+
+    result = inferencer.run(
+        image_path=args.image,
+        tiled=use_tiled,
+        tta=args.tta,
+        stride=args.stride,
+        batch_size=args.batch_size,
+        blend_mode=args.blend_mode,
+        apply_cleaner=args.cleaner,
+    )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     save_image(result.binary_mask * 255, output_dir / "mask.png")
     save_image(result.overlay_image, output_dir / "overlay.png")
-    save_json(result.to_dict(), output_dir / "result.json")
+    save_json(result.to_dict(), output_dir / "prediction_report.json")
 
-    report = result.to_prediction_report()
-    save_json(report, output_dir / "prediction_report.json")
+    # Generate visual overlay plot
+    vis = SegmentationVisualizer(output_dir=output_dir)
+    vis.plot_overlay(result.original_image, result.binary_mask, filename="visualization.png")
 
-    visualizer = SegmentationVisualizer(output_dir=output_dir)
-    visualizer.plot_overlay(
-        result.original_image,
-        result.binary_mask,
-        filename="visualization.png",
-    )
-
-    print("\n" + "=" * 50)
-    print("  PREDICTION REPORT")
-    print("=" * 50)
-    print(f"  Model:                 {report['model']}")
-    print(f"  Version:               {report['version']}")
-    print(f"  Roof Area (Pixels):    {report['roof_area_pixels']} px")
-    print(f"  Roof Area (%):         {report['roof_area_percent']}%")
-    print(f"  Usable Area (%):       {report['usable_area_percent']}%")
-    print(f"  Confidence:            {report['confidence']}")
-    print(f"  Area m² (Estimated):   {report['rooftop_area_m2_estimate']} m²")
-    print(f"  Is Estimated:          {report['is_estimated']}")
-    print(f"  Polygons Found:        {report['polygons_found']}")
-    print(f"  Processing Time:       {report['processing_time_ms']} ms")
-    print(f"  Report saved to:       {output_dir / 'prediction_report.json'}")
-    print("=" * 50 + "\n")
+    logger.info("Outputs saved to: %s", output_dir)
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
-    """Evaluate model on the official test set using trained weights."""
-    import torch
-
+    """Evaluate model performance on the official test set using trained weights."""
     from evaluation.metrics import SegmentationMetrics
-    from models.registry import ensure_models_registered, load_model_from_checkpoint
+    from inference.inferencer import SegmentationInferencer
     from preprocessing.augmentation import AugmentationPipeline
     from preprocessing.dataset_loader import MassachusettsDataset
     from utils.device_utils import get_device
@@ -251,18 +289,11 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     model_cfg = validate_model_config(model_config)
     dataset_cfg = validate_dataset_config(dataset_config)
 
-    ensure_models_registered()
-
     # Determine checkpoint path
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else find_best_available_checkpoint()
     if not checkpoint_path.exists():
         checkpoint_path = find_best_available_checkpoint()
     logger.info("Selected checkpoint: %s", checkpoint_path)
-
-    device = get_device()
-    logger.info("Loading trained weights from checkpoint: %s", checkpoint_path)
-    model = load_model_from_checkpoint(checkpoint_path, device=device)
-    model.eval()
 
     test_img_paths, test_mask_paths = MassachusettsDataset.discover_pairs(
         root_dir=dataset_cfg["root_dir"],
@@ -271,32 +302,45 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         extensions=dataset_cfg.get("image_extensions"),
     )
 
-    augmentation = AugmentationPipeline(image_size=model_cfg["image_size"])
-    test_dataset = MassachusettsDataset(
-        image_paths=test_img_paths,
-        mask_paths=test_mask_paths,
-        image_size=model_cfg["image_size"],
-        transform=augmentation.get_val_transform(),
+    use_tiled = args.tiled
+    inferencer = SegmentationInferencer(
+        checkpoint_path=checkpoint_path,
+        image_size=args.tile_size or model_cfg.get("image_size", 512),
+        tile_stride=args.stride or 256,
+        tile_batch_size=args.batch_size or 8,
+        blend_mode=args.blend_mode or "gaussian",
+        apply_cleaner=args.cleaner,
     )
 
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=4, shuffle=False, num_workers=2
-    )
+    metrics = SegmentationMetrics(num_classes=2)
 
-    metrics = SegmentationMetrics(num_classes=getattr(model, "num_labels", 2))
+    for img_p, msk_p in zip(test_img_paths, test_mask_paths):
+        res = inferencer.run(
+            img_p,
+            tiled=use_tiled,
+            tta=args.tta,
+            stride=args.stride,
+            batch_size=args.batch_size,
+            blend_mode=args.blend_mode,
+            apply_cleaner=args.cleaner,
+        )
+        gt_mask = cv2.imread(str(msk_p), cv2.IMREAD_GRAYSCALE)
+        gt_binary = (gt_mask >= dataset_cfg.get("mask_building_value", 255) // 2).astype(np.uint8)
 
-    with torch.no_grad():
-        for batch in test_loader:
-            pixel_values = batch["pixel_values"].to(device)
-            labels = batch["labels"].to(device)
-            prediction = model.predict(pixel_values)
-            metrics.update(prediction["binary_mask"], labels)
+        # Compare at result mask resolution
+        if res.binary_mask.shape != gt_binary.shape:
+            gt_eval = cv2.resize(gt_binary, (res.binary_mask.shape[1], res.binary_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+        else:
+            gt_eval = gt_binary
+
+        metrics.update(res.binary_mask, gt_eval)
 
     results = metrics.compute()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Read checkpoint metadata
+    import torch
     ckpt_raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     epoch = ckpt_raw.get("epoch", -1)
 
@@ -305,10 +349,10 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         "epoch": epoch,
         "dataset": "Massachusetts Buildings Dataset",
         "split": "test",
-        "num_samples": len(test_dataset),
-        "model_type": getattr(model, "model_type", "segformer"),
-        "backbone": getattr(model, "backbone_name", model_cfg.get("backbone", "nvidia/mit-b2")),
-        "image_size": model_cfg.get("image_size", 512),
+        "num_samples": len(test_img_paths),
+        "strategy": "tiled_native_resolution" if use_tiled else "single_pass_resize",
+        "tta": args.tta,
+        "cleaner": args.cleaner,
         "primary_evaluation": {
             "pixel_accuracy": round(results["pixel_accuracy"], 4),
             "mean_iou": round(results["iou"], 4),
@@ -325,8 +369,10 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     print("=" * 60)
     print(f"  Checkpoint Loaded : {checkpoint_path}")
     print(f"  Epoch             : {epoch}")
-    print(f"  Test Samples      : {len(test_dataset)}")
-    print(f"  Evaluation Mode   : Native Model Resolution (512x512)")
+    print(f"  Test Samples      : {len(test_img_paths)}")
+    print(f"  Evaluation Mode   : {'Native Tiled (1500x1500)' if use_tiled else 'Single Pass (512x512)'}")
+    print(f"  TTA Enabled       : {args.tta}")
+    print(f"  Cleaner Applied   : {args.cleaner}")
     print("-" * 60)
     print(f"  Pixel Accuracy    : {results['pixel_accuracy'] * 100:.2f}%")
     print(f"  Mean IoU          : {results['iou'] * 100:.2f}%")
@@ -334,6 +380,33 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     print(f"  Rooftop Dice      : {results['rooftop_dice'] * 100:.2f}%")
     print("-" * 60)
     print(f"  Results saved to  : {output_dir / 'evaluation_results.json'}")
+    print("=" * 60 + "\n")
+
+
+def cmd_measure_imbalance(args: argparse.Namespace) -> None:
+    """Measure class distribution on training split."""
+    from utils.class_imbalance import compute_training_class_imbalance
+
+    dataset_config = load_config(args.dataset_config)
+    dataset_cfg = validate_dataset_config(dataset_config)
+
+    stats = compute_training_class_imbalance(
+        root_dir=dataset_cfg["root_dir"],
+        train_images_dir=dataset_cfg.get("train_images_dir", "train"),
+        train_masks_dir=dataset_cfg.get("train_masks_dir", "train_labels"),
+        mask_building_value=dataset_cfg.get("mask_building_value", 255),
+    )
+
+    print("\n" + "=" * 60)
+    print("  TRAINING SET CLASS DISTRIBUTION REPORT")
+    print("=" * 60)
+    print(f"  Images Analyzed    : {stats['total_images']}")
+    print(f"  Total Pixels       : {stats['total_pixels']:,}")
+    print(f"  Background Pixels  : {stats['background_pixels']:,} ({stats['background_percentage']}%)")
+    print(f"  Rooftop Pixels     : {stats['rooftop_pixels']:,} ({stats['rooftop_percentage']}%)")
+    print("-" * 60)
+    print(f"  Recommended pos_weight  : {stats['pos_weight']}")
+    print(f"  Recommended focal_alpha : {stats['focal_alpha']}")
     print("=" * 60 + "\n")
 
 
@@ -420,7 +493,14 @@ def main() -> None:
     train_parser.add_argument("--dataset-config", default="configs/dataset_config.yaml")
     train_parser.add_argument("--training-config", default="configs/training_config.yaml")
     train_parser.add_argument("--experiment-dir", default="outputs/experiments")
-    train_parser.add_argument("--exp-name", default=None, help="Custom exp name (e.g. exp_001)")
+    train_parser.add_argument("--exp-name", default=None, help="Custom exp name (e.g. exp_003)")
+    train_parser.add_argument("--tiled", action="store_true", default=None, help="Enable native-resolution patch training")
+    train_parser.add_argument("--no-tiled", dest="tiled", action="store_false", help="Disable tiling (whole image resize)")
+    train_parser.add_argument("--tile-size", type=int, default=None, help="Patch size (default 512)")
+    train_parser.add_argument("--stride", type=int, default=None, help="Tile stride (default 256)")
+    train_parser.add_argument("--loss", choices=["focal_dice", "ce_dice", "bce_dice"], default=None, help="Loss function")
+    train_parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
+    train_parser.add_argument("--batch-size", type=int, default=None, help="Batch size")
 
     # Infer
     infer_parser = subparsers.add_parser("infer", help="Run inference")
@@ -429,6 +509,14 @@ def main() -> None:
     infer_parser.add_argument("--output-dir", default="outputs/predictions")
     infer_parser.add_argument("--model-config", default="configs/model_config.yaml")
     infer_parser.add_argument("--dataset-config", default="configs/dataset_config.yaml")
+    infer_parser.add_argument("--tiled", action="store_true", default=True, help="Use native-resolution sliding-window inference")
+    infer_parser.add_argument("--no-tiled", dest="tiled", action="store_false", help="Use single-pass resize inference")
+    infer_parser.add_argument("--tta", action="store_true", default=False, help="Enable Test-Time Augmentation")
+    infer_parser.add_argument("--cleaner", action="store_true", default=False, help="Apply MaskCleaner postprocessing")
+    infer_parser.add_argument("--tile-size", type=int, default=512, help="Tile size (default 512)")
+    infer_parser.add_argument("--stride", type=int, default=256, help="Tile stride (default 256)")
+    infer_parser.add_argument("--batch-size", type=int, default=8, help="Batch size for tiles")
+    infer_parser.add_argument("--blend-mode", choices=["gaussian", "uniform"], default="gaussian")
 
     # Evaluate
     eval_parser = subparsers.add_parser("evaluate", help="Evaluate model")
@@ -436,6 +524,17 @@ def main() -> None:
     eval_parser.add_argument("--output-dir", default="outputs/reports")
     eval_parser.add_argument("--model-config", default="configs/model_config.yaml")
     eval_parser.add_argument("--dataset-config", default="configs/dataset_config.yaml")
+    eval_parser.add_argument("--tiled", action="store_true", default=False, help="Evaluate using native-resolution sliding window")
+    eval_parser.add_argument("--tta", action="store_true", default=False, help="Enable Test-Time Augmentation")
+    eval_parser.add_argument("--cleaner", action="store_true", default=False, help="Apply MaskCleaner diagnostic")
+    eval_parser.add_argument("--tile-size", type=int, default=512)
+    eval_parser.add_argument("--stride", type=int, default=256)
+    eval_parser.add_argument("--batch-size", type=int, default=8)
+    eval_parser.add_argument("--blend-mode", choices=["gaussian", "uniform"], default="gaussian")
+
+    # Measure Imbalance
+    imb_parser = subparsers.add_parser("measure-imbalance", help="Measure training set class distribution")
+    imb_parser.add_argument("--dataset-config", default="configs/dataset_config.yaml")
 
     # Verify
     verify_parser = subparsers.add_parser("verify-dataset", help="Verify dataset")
@@ -450,6 +549,7 @@ def main() -> None:
         "train": cmd_train,
         "infer": cmd_infer,
         "evaluate": cmd_evaluate,
+        "measure-imbalance": cmd_measure_imbalance,
         "verify-dataset": cmd_verify_dataset,
     }
 

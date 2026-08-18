@@ -1,12 +1,12 @@
 """
 Standalone inference module for the segmentation framework.
 
-Completely independent from the training pipeline. Loads ANY registered
-model from a checkpoint (auto-detecting the model type) and runs
-segmentation on individual images, returning structured results.
+Supports both single-pass whole-image inference and native-resolution sliding-window
+tiled inference with Gaussian/Uniform blending, batched tile forwarding, and optional
+Test-Time Augmentation (TTA).
 
-The ``SegmentationResult`` dataclass and ``prediction_report.json``
-provide standard contracts consumed directly by downstream modules.
+The ``SegmentationResult`` dataclass and ``prediction_report.json`` provide
+standard contracts consumed directly by downstream modules.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.amp import autocast
 
 from models.registry import ensure_models_registered, load_model_from_checkpoint
@@ -27,11 +28,50 @@ from postprocessing.area_estimator import AreaEstimator
 from postprocessing.mask_cleaner import MaskCleaner
 from postprocessing.polygon_extractor import PolygonExtractor
 from preprocessing.augmentation import AugmentationPipeline
-from preprocessing.normalizer import ImageNormalizer
+from preprocessing.tiled_dataset import generate_tile_coordinates
 from utils.checkpoint_manager import find_best_available_checkpoint
 from utils.device_utils import get_device
 
 logger = logging.getLogger(__name__)
+
+
+def generate_gaussian_weight_map(
+    tile_size: int = 512,
+    sigma: Optional[float] = None,
+    min_weight: float = 0.1,
+) -> np.ndarray:
+    """
+    Generate a 2D Gaussian weight window for seamless tile blending.
+
+    Weights are peak at center (1.0) and smoothly decay toward borders,
+    bounded away from zero by min_weight to prevent edge pixel starvation.
+
+    Args:
+        tile_size: Square tile dimension.
+        sigma: Standard deviation of Gaussian distribution. Defaults to tile_size / 4.
+        min_weight: Minimum weight floor at tile borders.
+
+    Returns:
+        2D numpy array of shape (tile_size, tile_size) with float32 weights.
+    """
+    if sigma is None:
+        sigma = tile_size / 4.0
+
+    y, x = np.ogrid[
+        -(tile_size - 1) / 2 : (tile_size - 1) / 2 : complex(0, tile_size),
+        -(tile_size - 1) / 2 : (tile_size - 1) / 2 : complex(0, tile_size),
+    ]
+    gaussian = np.exp(-(x * x + y * y) / (2.0 * sigma * sigma))
+
+    # Normalize to [min_weight, 1.0]
+    g_min = gaussian.min()
+    g_max = gaussian.max()
+    if g_max > g_min:
+        gaussian = min_weight + (1.0 - min_weight) * (gaussian - g_min) / (g_max - g_min)
+    else:
+        gaussian = np.ones((tile_size, tile_size), dtype=np.float32)
+
+    return gaussian.astype(np.float32)
 
 
 @dataclass
@@ -100,35 +140,47 @@ class SegmentationResult:
 
 class SegmentationInferencer:
     """
-    Model-agnostic segmentation inference engine.
+    Model-agnostic segmentation inference engine with native-resolution tiling support.
 
-    Loads ANY registered model from a checkpoint and runs segmentation
-    on individual images. The model type is auto-detected from the checkpoint file.
+    Loads ANY registered model from a checkpoint and runs single-pass or sliding-window
+    tiled inference on individual images.
 
     Args:
-        checkpoint_path: Path to the saved model checkpoint (auto-selects best if None).
-        image_size: Input image size for the model.
-        confidence_threshold: Threshold for binary mask generation.
-        gsd: Ground Sampling Distance in metres per pixel (optional).
+        checkpoint_path: Path to saved model checkpoint (auto-selects best if None).
+        image_size: Input tile/image size for model (default 512).
+        tile_stride: Step size between tiles for tiled inference (default 256).
+        tile_batch_size: Number of tiles to batch per forward pass (default 8).
+        blend_mode: Blending window type ('gaussian' or 'uniform').
+        confidence_threshold: Threshold for binary mask generation (default 0.5).
+        gsd: Ground Sampling Distance in metres per pixel (default 1.0).
         device: Inference device (auto-detected if None).
         apply_cleaner: Whether to apply morphological MaskCleaner postprocessing (default False).
+        cleaner_min_area: Minimum area for MaskCleaner connected components (default 50).
     """
 
     def __init__(
         self,
         checkpoint_path: Optional[str | Path] = None,
         image_size: int = 512,
+        tile_stride: int = 256,
+        tile_batch_size: int = 8,
+        blend_mode: str = "gaussian",
         confidence_threshold: float = 0.5,
         gsd: Optional[float] = 1.0,
         device: Optional[torch.device] = None,
         apply_cleaner: bool = False,
+        cleaner_min_area: int = 50,
     ) -> None:
         self.image_size = image_size
+        self.tile_stride = tile_stride
+        self.tile_batch_size = tile_batch_size
+        self.blend_mode = blend_mode.lower()
         self.confidence_threshold = confidence_threshold
         self.gsd = gsd
         self.device = device or get_device()
         self.use_amp = self.device.type == "cuda"
         self.apply_cleaner = apply_cleaner
+        self.cleaner_min_area = cleaner_min_area
 
         ensure_models_registered()
 
@@ -148,9 +200,13 @@ class SegmentationInferencer:
 
         # Normalization and postprocessing pipelines
         self.aug = AugmentationPipeline(image_size=image_size)
-        self.mask_cleaner = MaskCleaner(min_region_area=50)
+        self.mask_cleaner = MaskCleaner(min_region_area=cleaner_min_area)
         self.polygon_extractor = PolygonExtractor()
         self.area_estimator = AreaEstimator(gsd=gsd)
+
+        # Precompute Gaussian and Uniform weight maps
+        self.gaussian_weight = generate_gaussian_weight_map(tile_size=image_size)
+        self.uniform_weight = np.ones((image_size, image_size), dtype=np.float32)
 
         logger.info(
             "SegmentationInferencer ready (model=%s, checkpoint=%s, device=%s, image_size=%d, amp=%s)",
@@ -161,12 +217,164 @@ class SegmentationInferencer:
             self.use_amp,
         )
 
-    def run(self, image_path: str | Path) -> SegmentationResult:
+    def _predict_batch_with_tta(
+        self,
+        batch_tensors: torch.Tensor,
+        tta_enabled: bool = False,
+    ) -> torch.Tensor:
+        """
+        Run forward pass on a batch of tile tensors with optional TTA.
+
+        Args:
+            batch_tensors: Tensor of shape (B, 3, H, W) on device.
+            tta_enabled: If True, averages predictions over isometric transforms.
+
+        Returns:
+            Probability tensor of shape (B, num_classes, H, W).
+        """
+        self.model_instance.eval()
+        with torch.no_grad():
+            with autocast(device_type="cuda", enabled=self.use_amp):
+                # 1. Base forward pass
+                out_base = self.model_instance.forward(batch_tensors)
+                prob_base = F.softmax(out_base["upsampled_logits"], dim=1)
+
+                if not tta_enabled:
+                    return prob_base
+
+                # 2. Horizontal Flip
+                hflip_tensors = torch.flip(batch_tensors, dims=[3])
+                out_hflip = self.model_instance.forward(hflip_tensors)
+                prob_hflip = torch.flip(
+                    F.softmax(out_hflip["upsampled_logits"], dim=1), dims=[3]
+                )
+
+                # 3. Vertical Flip
+                vflip_tensors = torch.flip(batch_tensors, dims=[2])
+                out_vflip = self.model_instance.forward(vflip_tensors)
+                prob_vflip = torch.flip(
+                    F.softmax(out_vflip["upsampled_logits"], dim=1), dims=[2]
+                )
+
+                # 4. Rotation 90 degrees
+                rot90_tensors = torch.rot90(batch_tensors, k=1, dims=[2, 3])
+                out_rot90 = self.model_instance.forward(rot90_tensors)
+                prob_rot90 = torch.rot90(
+                    F.softmax(out_rot90["upsampled_logits"], dim=1), k=-1, dims=[2, 3]
+                )
+
+                # Average across 4 augmentations
+                prob_avg = (prob_base + prob_hflip + prob_vflip + prob_rot90) / 4.0
+                return prob_avg
+
+    def _run_tiled_inference(
+        self,
+        original_image: np.ndarray,
+        tile_size: int,
+        stride: int,
+        batch_size: int,
+        blend_mode: str,
+        tta_enabled: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Execute sliding-window inference with probability accumulation and blending.
+
+        Returns:
+            Tuple of (binary_mask (H, W), confidence_map (H, W)) at original resolution.
+        """
+        h, w = original_image.shape[:2]
+        num_classes = getattr(self.model_instance, "num_labels", 2)
+
+        # Coordinate grid for full image coverage
+        coords = generate_tile_coordinates(
+            image_width=w,
+            image_height=h,
+            tile_size=tile_size,
+            stride=stride,
+        )
+
+        # Select blend weight map
+        if blend_mode == "uniform":
+            weight_window = self.uniform_weight
+        else:
+            weight_window = self.gaussian_weight
+
+        # Accumulation buffers: (num_classes, H, W) and (H, W)
+        prob_accumulator = np.zeros((num_classes, h, w), dtype=np.float32)
+        weight_accumulator = np.zeros((h, w), dtype=np.float32)
+
+        val_transform = self.aug.get_val_transform()
+
+        # Process in batches
+        for i in range(0, len(coords), batch_size):
+            batch_coords = coords[i : i + batch_size]
+            batch_tiles = []
+
+            for x1, y1, x2, y2 in batch_coords:
+                crop = original_image[y1:y2, x1:x2]
+                # Pad if tile is smaller than tile_size (small image edge case)
+                if crop.shape[0] < tile_size or crop.shape[1] < tile_size:
+                    pad_h = max(0, tile_size - crop.shape[0])
+                    pad_w = max(0, tile_size - crop.shape[1])
+                    crop = cv2.copyMakeBorder(
+                        crop, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT
+                    )
+
+                augmented = val_transform(image=crop)
+                t = torch.from_numpy(augmented["image"]).permute(2, 0, 1).float() / 255.0
+                batch_tiles.append(t)
+
+            batch_tensor = torch.stack(batch_tiles, dim=0).to(self.device)
+
+            # Predict batch with optional TTA
+            batch_probs = self._predict_batch_with_tta(
+                batch_tensor, tta_enabled=tta_enabled
+            )
+            batch_probs_np = batch_probs.cpu().numpy()
+
+            # Accumulate each tile into full-resolution map
+            for b_idx, (x1, y1, x2, y2) in enumerate(batch_coords):
+                tile_p = batch_probs_np[b_idx]  # (num_classes, tile_size, tile_size)
+                crop_h = y2 - y1
+                crop_w = x2 - x1
+
+                tile_p_valid = tile_p[:, :crop_h, :crop_w]
+                weight_valid = weight_window[:crop_h, :crop_w]
+
+                prob_accumulator[:, y1:y2, x1:x2] += tile_p_valid * weight_valid[np.newaxis, :, :]
+                weight_accumulator[y1:y2, x1:x2] += weight_valid
+
+        # Normalize by total accumulated weights
+        weight_safe = np.maximum(weight_accumulator, 1e-7)
+        normalized_probs = prob_accumulator / weight_safe[np.newaxis, :, :]
+
+        foreground_prob = normalized_probs[1]
+        binary_mask = (foreground_prob >= self.confidence_threshold).astype(np.uint8)
+
+        return binary_mask, foreground_prob
+
+    def run(
+        self,
+        image_path: str | Path,
+        tiled: bool = True,
+        tta: bool = False,
+        stride: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        blend_mode: Optional[str] = None,
+        apply_cleaner: Optional[bool] = None,
+    ) -> SegmentationResult:
         """
         Run full segmentation pipeline on a single image.
 
         Args:
             image_path: Path to the input image file.
+            tiled: If True, uses native-resolution sliding-window tiled inference.
+                   If False, uses legacy single-pass whole-image resize.
+            tta: Whether to apply Test-Time Augmentation (flips + rotations).
+            stride: Tile step size (defaults to instance setting, e.g. 256).
+            batch_size: Tile batch size (defaults to instance setting, e.g. 8).
+            blend_mode: 'gaussian' or 'uniform' blending.
+            apply_cleaner: Override for applying morphological MaskCleaner.
 
         Returns:
             SegmentationResult object.
@@ -184,43 +392,61 @@ class SegmentationInferencer:
         original = cv2.cvtColor(original, cv2.COLOR_BGR2RGB)
         original_h, original_w = original.shape[:2]
 
-        # 2. Resize & Normalize
-        resized = cv2.resize(
-            original,
-            (self.image_size, self.image_size),
-            interpolation=cv2.INTER_LINEAR,
-        )
-        augmented = self.aug.get_val_transform()(image=resized)
-        image_tensor = torch.from_numpy(augmented["image"]).permute(2, 0, 1).float() / 255.0
-        image_tensor = image_tensor.unsqueeze(0).to(self.device)
+        stride = stride or self.tile_stride
+        batch_size = batch_size or self.tile_batch_size
+        blend_mode = (blend_mode or self.blend_mode).lower()
+        use_cleaner = self.apply_cleaner if apply_cleaner is None else apply_cleaner
 
-        # 3. Model Inference (eval mode, no_grad, AMP if CUDA)
-        self.model_instance.eval()
-        with torch.no_grad():
-            with autocast(device_type="cuda", enabled=self.use_amp):
-                prediction = self.model_instance.predict(image_tensor)
-
-        binary_mask = prediction["binary_mask"].squeeze(0).cpu().numpy().astype(np.uint8)
-        confidence_map = prediction["confidence_map"].squeeze(0).cpu().numpy()
-
-        # 4. Postprocessing (Primary: raw reconstruction; Optional: cleaned)
-        if self.apply_cleaner:
-            processed_mask_512 = self.mask_cleaner.clean(binary_mask)
+        if tiled:
+            # Native-Resolution Sliding-Window Tiled Inference
+            binary_mask_raw, confidence_map = self._run_tiled_inference(
+                original_image=original,
+                tile_size=self.image_size,
+                stride=stride,
+                batch_size=batch_size,
+                blend_mode=blend_mode,
+                tta_enabled=tta,
+            )
+            strategy = "tiled_native_resolution"
         else:
-            processed_mask_512 = binary_mask
+            # Legacy Single-Pass 512x512 Resize Inference
+            resized = cv2.resize(
+                original,
+                (self.image_size, self.image_size),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            augmented = self.aug.get_val_transform()(image=resized)
+            image_tensor = torch.from_numpy(augmented["image"]).permute(2, 0, 1).float() / 255.0
+            image_tensor = image_tensor.unsqueeze(0).to(self.device)
 
-        final_mask_original = cv2.resize(
-            processed_mask_512,
-            (original_w, original_h),
-            interpolation=cv2.INTER_NEAREST,
-        )
+            self.model_instance.eval()
+            with torch.no_grad():
+                with autocast(device_type="cuda", enabled=self.use_amp):
+                    prediction = self.model_instance.predict(image_tensor)
 
-        polygons = self.polygon_extractor.extract(final_mask_original)
-        area_metrics = self.area_estimator.estimate(final_mask_original)
-        overlay = self._create_overlay(original, final_mask_original)
+            pred_mask_512 = prediction["binary_mask"].squeeze(0).cpu().numpy().astype(np.uint8)
+            conf_512 = prediction["confidence_map"].squeeze(0).cpu().numpy()
 
-        # Calculate mean confidence score on rooftop pixels
-        rooftop_pixels = binary_mask > 0
+            binary_mask_raw = cv2.resize(
+                pred_mask_512, (original_w, original_h), interpolation=cv2.INTER_NEAREST
+            )
+            confidence_map = cv2.resize(
+                conf_512, (original_w, original_h), interpolation=cv2.INTER_LINEAR
+            )
+            strategy = "single_pass_resize"
+
+        # 4. Postprocessing (Primary: raw mask; Optional: MaskCleaner diagnostic)
+        if use_cleaner:
+            final_mask = self.mask_cleaner.clean(binary_mask_raw)
+        else:
+            final_mask = binary_mask_raw
+
+        polygons = self.polygon_extractor.extract(final_mask)
+        area_metrics = self.area_estimator.estimate(final_mask)
+        overlay = self._create_overlay(original, final_mask)
+
+        # Calculate mean confidence score on detected rooftop pixels
+        rooftop_pixels = final_mask > 0
         confidence = (
             float(confidence_map[rooftop_pixels].mean())
             if rooftop_pixels.any()
@@ -231,7 +457,7 @@ class SegmentationInferencer:
 
         result = SegmentationResult(
             original_image=original,
-            binary_mask=final_mask_original,
+            binary_mask=final_mask,
             overlay_image=overlay,
             polygon=polygons,
             roof_area_pixels=area_metrics["roof_area_pixels"],
@@ -246,18 +472,23 @@ class SegmentationInferencer:
             image_path=str(image_path),
             metadata={
                 "checkpoint": str(self.checkpoint_path),
-                "apply_cleaner": self.apply_cleaner,
+                "strategy": strategy,
+                "tiled": tiled,
+                "tile_size": self.image_size,
+                "stride": stride if tiled else None,
+                "blend_mode": blend_mode if tiled else None,
+                "tta": tta,
+                "apply_cleaner": use_cleaner,
                 "input_resolution": f"{original_w}x{original_h}",
-                "model_resolution": f"{self.image_size}x{self.image_size}",
             },
         )
 
         logger.info(
-            "Inference complete: %s (roof_pixels=%d, roof_pct=%.1f%%, usable_pct=%.1f%%, conf=%.3f, time=%.1fms)",
+            "Inference complete (%s): %s (roof_pixels=%d, roof_pct=%.1f%%, conf=%.3f, time=%.1fms)",
+            strategy,
             image_path.name,
             result.roof_area_pixels,
             result.roof_area_percent,
-            result.usable_area_percent,
             result.confidence,
             result.processing_time_ms,
         )

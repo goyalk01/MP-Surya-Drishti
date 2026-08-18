@@ -30,7 +30,7 @@ Evaluation of the baseline SegFormer-B2 model on the official test set reveals t
 ## 2. Root Cause Technical Analysis
 
 ### 2.1 Spatial Resolution Downsampling (Loss of ~88% Information)
-* **Dataset Characteristics**: The Massachusetts Buildings Dataset provides high-resolution aerial imagery at $1500 \times 1500$ pixels per tile ($0.1\text{m/pixel}$ Ground Sample Distance).
+* **Dataset Characteristics**: The Massachusetts Buildings Dataset provides aerial imagery at $1500 \times 1500$ pixels per tile ($1.0\text{ m/pixel}$ Ground Sample Distance).
 * **Current Implementation Mechanics**: In the baseline pipeline, each $1500 \times 1500$ image is resized to **$512 \times 512$** pixels prior to model forward pass.
 * **Mathematical & Spatial Impact**:
   $$\text{Spatial Compression Ratio} = \left(\frac{512}{1500}\right)^2 = \left(0.3413\right)^2 \approx 0.1165 \quad (\mathbf{88.35\%\text{ pixel reduction}})$$
